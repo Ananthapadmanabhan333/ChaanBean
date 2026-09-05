@@ -1,0 +1,9 @@
+# The voice plane never deploys to Vercel — it needs a process and UDP/RTP.
+asterisk/
+backend/tests/
+backend/spike/
+backend/alembic/
+docs/
+**/__pycache__/
+**/.pytest_cache/
+var/

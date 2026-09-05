@@ -197,6 +197,8 @@ and the decision logic are complete and tested, and the licensed data sources
 drop in behind them.
 
 - [docs/architecture.md](docs/architecture.md) — the system, in full
+- [docs/deployment.md](docs/deployment.md) — hosting, and what Vercel can and
+  cannot run
 - [docs/api-sourcing.md](docs/api-sourcing.md) — where to get every API, free
   tier first
 - [docs/provisioning-checklist.md](docs/provisioning-checklist.md) — what to

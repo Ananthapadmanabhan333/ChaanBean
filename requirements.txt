@@ -1,0 +1,34 @@
+# Core
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# Data
+SQLAlchemy==2.0.36
+psycopg[binary]==3.2.3
+redis==5.2.1
+
+# Vendors (unused until credentials exist; the local adapters need neither)
+boto3==1.35.92
+
+# Telephony — ARI is plain HTTP + a websocket, no client library needed
+httpx==0.28.1
+websockets==14.1
+
+# Auth
+# bcrypt directly, not passlib: passlib's last release predates bcrypt 4 and its
+# backend probe feeds an overlong secret to bcrypt.hashpw, which modern bcrypt
+# refuses. The wrapper bought nothing we used.
+bcrypt==4.2.1
+PyJWT==2.10.1
+python-multipart==0.0.20
+
+# Dev
+pytest==8.3.4
+pytest-asyncio==0.25.0
+time-machine==2.16.0
+import-linter==2.1
+defusedxml==0.7.1
+phonenumbers==8.13.52
+alembic==1.14.0
