@@ -1,0 +1,1984 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChaanBean — Payment recovery, on rails</title>
+<!-- Inline data URI rather than a file: the browser requests /favicon.ico on
+     every page load, and without this that is a guaranteed 404 in the log and a
+     red line in devtools. This costs no request at all. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230F3D22'/%3E%3Cpath d='M21.5 11.2a7 7 0 1 0 0 9.6' stroke='%2366CC4D' stroke-width='3.2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  /* ------------------------------------------------------------------ tokens
+     Sampled from leganapp.com rather than guessed: the greens, the navy, the
+     gold accent, Inter, and the 8px/16px/pill radius set are the values that
+     site actually computes. Light theme only — LegAn ships no dark mode, and a
+     half-invented dark palette would not match anything.                     */
+  :root {
+    --green-900: #0F3D22;   /* deepest, for the sidebar */
+    --green-800: #1E4C2E;   /* deep surfaces */
+    --green-700: #006B26;   /* PRIMARY brand green — buttons, active state */
+    --green-600: #0A7C34;
+    --green-400: #66CC4D;   /* bright accent, highlights */
+    --green-50:  #EEF7F0;   /* tinted surfaces */
+
+    --navy-900:  #02091D;
+    --navy-800:  #00203D;   /* headings */
+    --gold:      #FACC15;   /* the accent LegAn uses for emphasis */
+
+    --ink:       #111827;
+    --ink-muted: #4B5563;
+    --ink-faint: #6B7280;
+    --line:      #E5E7EB;
+    --line-soft: #F3F4F6;
+    --surface:   #FFFFFF;
+    --canvas:    #F7F8F7;
+
+    --danger:    #B42318;
+    --danger-bg: #FEF3F2;
+    --warn:      #B54708;
+    --warn-bg:   #FFFAEB;
+    --ok:        #027A48;
+    --ok-bg:     #ECFDF3;
+
+    --r-sm: 6px;
+    --r:    8px;
+    --r-lg: 16px;
+    --r-pill: 9999px;
+    --shadow: 0 1px 2px rgba(16,24,40,.05);
+    --shadow-lg: 0 4px 16px rgba(16,24,40,.08);
+    --sidebar: 232px;
+
+    /* ---- chart palette -------------------------------------------------
+       Ageing buckets are ORDINAL, not categorical: swapping their order
+       changes the meaning, so they take a one-hue ramp with monotone
+       lightness and the reader sees the order in the colour itself.
+       Verified: strictly decreasing luminance, every step >= 2:1 on white
+       (2.29, 3.12, 4.86, 8.33). CURRENT sits outside the ramp in neutral
+       grey because it is not overdue at all.
+       Refusal reasons are NOMINAL — every bar takes the same hue, because
+       colouring them by value would re-encode what bar length already shows. */
+    --age-0: #9AA4AF;  /* CURRENT — not yet due */
+    --age-1: #E89876;
+    --age-2: #DD7550;
+    --age-3: #C24A34;
+    --age-4: #8F2A20;  /* 90+ days */
+    --mark:  var(--green-700);   /* single-series magnitude */
+    --track: #EEF0EE;            /* recessive, never a dashed gridline */
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--canvas);
+    color: var(--ink);
+    font: 400 14px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; text-decoration: none; }
+  .hidden { display: none !important; }
+
+  /* ------------------------------------------------------------------ shell */
+  .app { display: grid; grid-template-columns: var(--sidebar) 1fr; min-height: 100vh; }
+
+  aside {
+    background: var(--green-900);
+    color: #fff;
+    display: flex; flex-direction: column;
+    position: sticky; top: 0; height: 100vh;
+  }
+  .brand { padding: 22px 20px 18px; display: flex; flex-direction: column; gap: 2px; }
+  .brand b { font-size: 19px; font-weight: 800; letter-spacing: -.02em; }
+  .brand b span { color: var(--green-400); }
+  .brand small {
+    font-size: 9.5px; letter-spacing: .22em; text-transform: uppercase;
+    color: rgba(255,255,255,.55); font-weight: 600;
+  }
+  nav { padding: 6px 12px; display: flex; flex-direction: column; gap: 2px; }
+  nav button {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 9px 12px; border: 0; border-radius: var(--r);
+    background: transparent; color: rgba(255,255,255,.78);
+    font: 500 13.5px/1 Inter, sans-serif; cursor: pointer; text-align: left;
+  }
+  nav button:hover { background: rgba(255,255,255,.07); color: #fff; }
+  nav button[aria-current="true"] { background: var(--green-700); color: #fff; font-weight: 600; }
+  nav button svg { width: 16px; height: 16px; flex: none; opacity: .9; }
+  .nav-foot {
+    margin-top: auto; padding: 14px 20px 18px;
+    border-top: 1px solid rgba(255,255,255,.1);
+    font-size: 11.5px; color: rgba(255,255,255,.5); line-height: 1.5;
+  }
+  .nav-foot b { color: rgba(255,255,255,.85); font-weight: 600; display: block; }
+
+  header.top {
+    background: var(--surface); border-bottom: 1px solid var(--line);
+    padding: 0 28px; height: 60px;
+    display: flex; align-items: center; gap: 14px;
+    position: sticky; top: 0; z-index: 20;
+  }
+  header.top h1 { font-size: 16px; font-weight: 700; margin: 0; letter-spacing: -.01em; color: var(--navy-800); }
+  .env {
+    font-size: 11px; color: var(--ink-faint); background: var(--line-soft);
+    padding: 3px 9px; border-radius: var(--r-pill); font-weight: 500;
+  }
+  .spacer { margin-left: auto; }
+
+  main { padding: 24px 28px 60px; max-width: 1440px; }
+  section { margin-bottom: 28px; }
+  h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--ink-faint); margin: 0 0 12px; font-weight: 700;
+  }
+  .lede { font-size: 13px; color: var(--ink-muted); margin: -4px 0 14px; max-width: 74ch; }
+
+  /* ------------------------------------------------------------------ parts */
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--r-lg); padding: 18px 20px; box-shadow: var(--shadow);
+  }
+  .stat { font-size: 27px; font-weight: 700; letter-spacing: -.025em;
+          font-variant-numeric: tabular-nums; color: var(--navy-800); line-height: 1.15; }
+  .stat.green { color: var(--green-700); }
+  .label { font-size: 12.5px; color: var(--ink-muted); margin-top: 4px; font-weight: 500; }
+  .hint { font-size: 11.5px; color: var(--ink-faint); margin-top: 8px; line-height: 1.45; }
+
+  .panel {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--r-lg); overflow: hidden; box-shadow: var(--shadow);
+  }
+  .panel-head {
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .panel-head h3 { margin: 0; font-size: 14px; font-weight: 650; color: var(--navy-800); }
+  .panel-head p { margin: 0; font-size: 12px; color: var(--ink-faint); }
+  .scroll { overflow-x: auto; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 11px 20px; white-space: nowrap; }
+  thead th {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--ink-faint); font-weight: 700;
+    background: var(--line-soft); border-bottom: 1px solid var(--line);
+  }
+  tbody tr { border-bottom: 1px solid var(--line-soft); }
+  tbody tr:last-child { border-bottom: 0; }
+  tbody tr:hover { background: #FAFBFA; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.wrap { white-space: normal; color: var(--ink-muted); min-width: 260px; }
+  .empty { padding: 26px 20px; color: var(--ink-faint); font-size: 13px; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 2.5px 10px; border-radius: var(--r-pill);
+    font-size: 11.5px; font-weight: 600; letter-spacing: .01em;
+    background: var(--line-soft); color: var(--ink-muted);
+  }
+  .pill.ok   { background: var(--ok-bg);   color: var(--ok); }
+  .pill.bad  { background: var(--danger-bg); color: var(--danger); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn); }
+  .pill.dot::before { content:""; width:5px; height:5px; border-radius:50%; background: currentColor; }
+
+  .yn { font-size: 12px; font-weight: 600; }
+  .yn.y { color: var(--ok); }
+  .yn.n { color: var(--ink-faint); font-weight: 500; }
+
+  .bar { height: 6px; border-radius: var(--r-pill); background: var(--line-soft); overflow: hidden; min-width: 90px; }
+  .bar i { display: block; height: 100%; background: var(--green-700); border-radius: var(--r-pill); }
+
+  /* ------------------------------------------------------------------ charts */
+  .chart { max-width: 100%; height: auto; display: block; overflow: visible; }
+  .chart .track { fill: var(--track); }
+  .chart .mark { fill: var(--mark); transition: opacity .12s; }
+  .chart g:hover .mark { opacity: .82; }
+  /* Text wears text tokens, never the series colour. */
+  .chart .lbl { fill: var(--ink-muted); font: 500 12px Inter, sans-serif; }
+  .chart .val { fill: var(--ink); font: 600 12px Inter, sans-serif; }
+  .chart .sub { fill: var(--ink-faint); font: 400 11px Inter, sans-serif; }
+  .chart .hit { fill: transparent; cursor: default; }
+
+  .hero { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  /* Proportional digits on a big standalone number — tabular makes it look gappy.
+     tabular-nums stays on the column figures, where alignment matters. */
+  .hero .fig {
+    font-size: 42px; font-weight: 700; letter-spacing: -.03em;
+    color: var(--green-700); line-height: 1.05; font-variant-numeric: proportional-nums;
+  }
+  .hero .delta { font-size: 13px; color: var(--ink-muted); font-weight: 500; }
+
+  .live { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px;
+          color: var(--ink-faint); font-weight: 500; }
+  .live .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green-400); }
+  .live.on .dot { animation: pulse 2s ease-in-out infinite; }
+  .live.paused .dot { background: var(--ink-faint); animation: none; }
+  @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); }
+                     50% { opacity: .35; transform: scale(.78); } }
+  @media (prefers-reduced-motion: reduce) { .live .dot { animation: none !important; } }
+
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px;
+                 font-size: 11.5px; color: var(--ink-muted); font-weight: 500; }
+  .legend i { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+
+  .two { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+  .card.click { cursor: pointer; transition: border-color .12s, box-shadow .12s, transform .12s; }
+  .card.click:hover { border-color: var(--green-400); box-shadow: var(--shadow-lg); transform: translateY(-1px); }
+
+  details.tableview { margin-top: 12px; }
+  details.tableview summary {
+    cursor: pointer; font-size: 12px; color: var(--ink-faint); font-weight: 600;
+    list-style: none; padding: 4px 0;
+  }
+  details.tableview summary::-webkit-details-marker { display: none; }
+  details.tableview summary::before { content: "▸ "; }
+  details.tableview[open] summary::before { content: "▾ "; }
+  details.tableview table { font-size: 12.5px; margin-top: 6px; }
+  details.tableview th, details.tableview td { padding: 6px 10px; }
+
+  button.btn {
+    font: 600 13px Inter, sans-serif; padding: 8px 16px; border-radius: var(--r);
+    border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+    cursor: pointer; transition: background .12s, border-color .12s;
+    white-space: nowrap; flex: none;
+  }
+  button.btn:hover { background: var(--line-soft); }
+  button.btn.primary { background: var(--green-700); border-color: var(--green-700); color: #fff; }
+  button.btn.primary:hover { background: var(--green-600); }
+  button.btn.sm { padding: 5px 12px; font-size: 12px; }
+
+  input {
+    font: 400 14px Inter, sans-serif; padding: 10px 12px; width: 100%;
+    border-radius: var(--r); border: 1px solid var(--line);
+    background: var(--surface); color: var(--ink);
+  }
+  input:focus { outline: 2px solid var(--green-400); outline-offset: -1px; border-color: var(--green-700); }
+  label.f { display: block; font-size: 12.5px; font-weight: 600; margin-bottom: 6px; color: var(--ink-muted); }
+
+  /* ------------------------------------------------------------ data entry
+     select had no styling at all, so it fell back to the platform control and
+     sat a good 4px off the inputs beside it. */
+  select {
+    font: 400 14px Inter, sans-serif; padding: 10px 12px; width: 100%;
+    border-radius: var(--r); border: 1px solid var(--line);
+    background: var(--surface); color: var(--ink); appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%236B7280' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 12px center;
+    padding-right: 32px;
+  }
+  select:focus { outline: 2px solid var(--green-400); outline-offset: -1px; border-color: var(--green-700); }
+
+  .addform { margin-bottom: 16px; }
+  .formgrid {
+    display: grid; gap: 14px 18px;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  }
+  .formgrid .wide { grid-column: 1 / -1; }
+  .addform label {
+    display: block; font-size: 12.5px; font-weight: 600; margin-bottom: 6px;
+    color: var(--ink-muted);
+  }
+  .addform label span { font-weight: 500; color: var(--ink-faint); }
+  .addform .field { margin-bottom: 0; }
+  .addform .hint { margin-top: 6px; }
+  .subhead {
+    margin: 22px 0 14px; padding-top: 18px; border-top: 1px solid var(--line);
+    font-size: 12.5px; font-weight: 650; color: var(--navy-800);
+  }
+  .subhead span { font-weight: 500; color: var(--ink-faint); }
+  .formactions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+
+  /* ------------------------------------------------- credit check result */
+  .check { display: flex; gap: 10px; align-items: start; margin-top: 16px; }
+  .check input { width: auto; margin-top: 2px; flex: none; }
+  .check span { font-size: 12px; color: var(--ink-muted); line-height: 1.5; }
+
+  .result { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line); }
+  .reshead { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; margin-bottom: 18px; }
+  .reshead > div { display: flex; flex-direction: column; }
+  .reshead b { font-size: 21px; letter-spacing: -.02em; color: var(--navy-800); }
+  .reshead span { font-size: 11.5px; color: var(--ink-faint); }
+  .reshead .score { margin-left: auto; text-align: right; }
+
+  /* Blockers are not a factor among factors — they are the reason the number
+     above them must not be read as an endorsement, so they sit apart. */
+  .blockers {
+    background: var(--danger-bg); border-radius: var(--r);
+    padding: 14px 16px; margin-bottom: 18px;
+  }
+  .blockers b { font-size: 12.5px; color: var(--danger); }
+  .blockers ul { margin: 8px 0 0; padding-left: 18px; }
+  .blockers li { font-size: 13px; color: var(--ink); margin-bottom: 4px; }
+
+  .why b { font-size: 12.5px; color: var(--navy-800); }
+  table.factors { margin-top: 8px; }
+  table.factors td { padding: 7px 0; font-size: 13px; border-bottom: 1px solid var(--line-soft); }
+  table.factors td.num { text-align: right; font-variant-numeric: tabular-nums;
+                         font-weight: 600; white-space: nowrap; padding-left: 16px; }
+  .why code { font-size: 11.5px; background: var(--line-soft); padding: 1px 5px; border-radius: 4px; }
+
+  .decide { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+  .decided {
+    margin-top: 22px; padding: 14px 16px; border-radius: var(--r);
+    background: var(--ok-bg); color: var(--ink); font-size: 13.5px;
+  }
+  /* The reference under a buyer's name — present but not competing with it. */
+  td .sub { font-size: 11.5px; color: var(--ink-faint); margin-top: 2px; }
+
+  /* ------------------------------------------------------------------ login */
+  .login-wrap {
+    min-height: 100vh; display: grid; grid-template-columns: 1fr 1fr;
+  }
+  .login-art {
+    background: linear-gradient(150deg, var(--green-900) 0%, var(--green-700) 55%, var(--green-600) 100%);
+    color: #fff; padding: 52px 56px; display: flex; flex-direction: column;
+  }
+  .login-art .brand b { font-size: 24px; }
+  .login-art h2 {
+    /* Two short lines, so let them carry the panel. Fluid rather than stepped:
+       the headline is the one element that should never look timid at any width. */
+    color: #fff; font-size: clamp(30px, 3.3vw, 46px); line-height: 1.12;
+    letter-spacing: -.035em;
+    text-transform: none; margin: auto 0 20px; font-weight: 700; max-width: 15ch;
+  }
+  .login-art h2 em { font-style: normal; color: var(--green-400); }
+  .login-art p { font-size: 14.5px; color: rgba(255,255,255,.8); max-width: 42ch; margin: 0 0 34px; }
+  .proof {
+    display: flex; gap: 26px; margin: 0 0 30px; flex-wrap: wrap;
+    padding-bottom: 26px; border-bottom: 1px solid rgba(255,255,255,.16);
+  }
+  .proof div { display: flex; flex-direction: column; gap: 2px; }
+  .proof b {
+    font-size: 25px; font-weight: 700; letter-spacing: -.02em; color: var(--green-400);
+    line-height: 1.1;
+  }
+  .proof span { font-size: 11.5px; color: rgba(255,255,255,.7); font-weight: 500; }
+  /* ---------------------------------------------------------- the ladder
+     A login screen that loops an animation forever is a distraction, so this
+     plays once: the rail fills top to bottom while each rung lights up in
+     turn, timed to arrive just behind it. Only the settled rung keeps moving,
+     and barely. */
+  .ladder { position: relative; padding-left: 30px; margin: 0 0 auto; }
+  .ladder .rail {
+    position: absolute; left: 5px; top: 8px; bottom: 26px; width: 2px;
+    background: rgba(255,255,255,.15); border-radius: 2px; overflow: hidden;
+  }
+  .ladder .rail i {
+    position: absolute; left: 0; top: 0; width: 100%; height: 0; display: block;
+    background: linear-gradient(180deg, var(--green-400), var(--gold));
+    animation: railFill 2.4s var(--ease) .25s forwards;
+  }
+  @keyframes railFill { to { height: 100%; } }
+
+  .ladder ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 15px; }
+  .ladder li { position: relative; animation: rungIn .55s var(--ease) both; }
+  .ladder li::before {
+    content: ""; position: absolute; left: -30px; top: 3px;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--green-400); box-shadow: 0 0 0 3px var(--green-900);
+    animation: rungDot .5s var(--ease) both;
+  }
+  .ladder li b {
+    display: block; font-size: 10.5px; font-weight: 700; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--green-400); margin-bottom: 1px;
+  }
+  .ladder li span { font-size: 13.5px; color: rgba(255,255,255,.88); }
+
+  /* The last rung is the payoff, so it is the one that changes colour. */
+  .ladder li.paid::before { background: var(--gold); }
+  .ladder li.paid b { color: var(--gold); }
+  .ladder li.paid span { color: #fff; font-weight: 500; }
+  .ladder li.paid::after {
+    content: ""; position: absolute; left: -30px; top: 3px;
+    width: 12px; height: 12px; border-radius: 50%; background: var(--gold);
+    animation: rungHalo 2.6s ease-out 2.9s infinite;
+  }
+
+  @keyframes rungIn  { from { opacity: 0; transform: translateY(7px); } }
+  @keyframes rungDot { from { opacity: 0; transform: scale(.3); } }
+  @keyframes rungHalo {
+    0%        { opacity: .55; transform: scale(1); }
+    70%, 100% { opacity: 0;   transform: scale(2.6); }
+  }
+
+  /* Each rung arrives just after the rail reaches it. */
+  .ladder li:nth-child(1), .ladder li:nth-child(1)::before { animation-delay: .35s; }
+  .ladder li:nth-child(2), .ladder li:nth-child(2)::before { animation-delay: .8s; }
+  .ladder li:nth-child(3), .ladder li:nth-child(3)::before { animation-delay: 1.25s; }
+  .ladder li:nth-child(4), .ladder li:nth-child(4)::before { animation-delay: 1.7s; }
+  .ladder li:nth-child(5), .ladder li:nth-child(5)::before { animation-delay: 2.15s; }
+
+  .login-art ul { list-style: none; padding: 0; margin: 0 0 auto; display: grid; gap: 14px; }
+  .login-art li span b { color: #fff; font-weight: 650; }
+  .login-art li { font-size: 13.5px; color: rgba(255,255,255,.9); display: flex; gap: 10px; align-items: start; }
+  .login-art li b { color: var(--gold); font-weight: 700; }
+
+  /* The generic .login-art li rules above are a flex row with a gold marker —
+     written for the old tick list. They sit later in the cascade than .ladder
+     and match at the same specificity, so the ladder has to out-specify them
+     rather than merely come first. */
+  .login-art .ladder ul { margin: 0; gap: 15px; }
+  .login-art .ladder li { display: block; }
+  .login-art .ladder li b { color: var(--green-400); }
+  .login-art .ladder li.paid b { color: var(--gold); }
+  .login-form { display: flex; align-items: center; justify-content: center; padding: 40px; background: var(--surface); }
+  .login-box { width: 100%; max-width: 372px; }
+  .login-box h3 { font-size: 22px; margin: 0 0 6px; letter-spacing: -.02em; color: var(--navy-800); }
+  .login-box > p { color: var(--ink-muted); margin: 0 0 26px; font-size: 13.5px; }
+  .field { margin-bottom: 15px; }
+  .err { color: var(--danger); font-size: 13px; min-height: 20px; margin-top: 10px; font-weight: 500; }
+  button.btn.google {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    font-weight: 600; border-color: #DADCE0;
+  }
+  button.btn.google:hover { background: #F8F9FA; }
+  .divider { display: flex; align-items: center; gap: 12px; margin: 16px 0; }
+  .divider::before, .divider::after {
+    content: ""; flex: 1; height: 1px; background: var(--line);
+  }
+  .divider span { font-size: 11.5px; color: var(--ink-faint); font-weight: 500; }
+  .switch { font-size: 13px; color: var(--ink-muted); margin: 16px 0 0; text-align: center; }
+  .switch a { color: var(--green-700); font-weight: 600; text-decoration: underline; }
+
+  /* Whose portal this is. Multi-tenant by construction — the name comes from
+     the token's company, and RLS means it cannot be pointed anywhere else. */
+  .crumb {
+    font-size: 12.5px; font-weight: 600; color: var(--green-700);
+    background: var(--green-50); border: 1px solid #D6E7DA;
+    padding: 3px 10px; border-radius: var(--r-pill);
+    max-width: 26ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  /* -------------------------------------------------------------- responsive
+     Three real layouts rather than one that merely shrinks: desktop rail,
+     tablet with a compact rail, and a mobile scroll-nav. */
+
+  /* Tablet — keep the rail, drop it to icons-plus-label at a narrower width. */
+
+  /* ------------------------------------------------------------- animation
+     Restrained on purpose. This is a compliance tool that decides whether to
+     phone someone about a debt — motion should make it feel responsive and
+     precise, never playful. So: short durations, a single easing curve, no
+     bounce, and nothing that delays a number the operator is trying to read.
+
+     Every rule here is switched off wholesale under `prefers-reduced-motion`,
+     which is a real accessibility setting and not a nicety. */
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes growX { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+  @keyframes slideIn { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: none; } }
+
+  :root { --ease: cubic-bezier(.32, .72, 0, 1); }
+
+  /* Cards enter in a short stagger, so the eye lands top-left first. Capped at
+     six steps — past that the last card feels late rather than sequenced. */
+  main section { animation: rise .34s var(--ease) both; }
+  main section:nth-of-type(2) { animation-delay: .04s; }
+  main section:nth-of-type(3) { animation-delay: .08s; }
+  main section:nth-of-type(4) { animation-delay: .12s; }
+  main section:nth-of-type(5) { animation-delay: .16s; }
+
+  .grid > .card { animation: rise .3s var(--ease) both; }
+  .grid > .card:nth-child(2) { animation-delay: .05s; }
+  .grid > .card:nth-child(3) { animation-delay: .1s; }
+  .grid > .card:nth-child(4) { animation-delay: .15s; }
+
+  /* Bars grow from the axis, which is the direction the value actually reads. */
+  .chart .mark { transform-origin: left center; animation: growX .5s var(--ease) both; }
+  .chart g:nth-child(2) .mark { animation-delay: .04s; }
+  .chart g:nth-child(3) .mark { animation-delay: .08s; }
+  .chart g:nth-child(4) .mark { animation-delay: .12s; }
+  .chart g:nth-child(5) .mark { animation-delay: .16s; }
+  .chart .val, .chart .lbl { animation: fade .45s var(--ease) both .12s; }
+
+  .bar i { transform-origin: left center; animation: growX .45s var(--ease) both; }
+
+  nav button { animation: slideIn .3s var(--ease) both; }
+  nav button:nth-child(2) { animation-delay: .03s; }
+  nav button:nth-child(3) { animation-delay: .06s; }
+  nav button:nth-child(4) { animation-delay: .09s; }
+  nav button:nth-child(5) { animation-delay: .12s; }
+  nav button:nth-child(6) { animation-delay: .15s; }
+
+  tbody tr { animation: fade .3s var(--ease) both; }
+
+  /* Login: the panel and its proof points arrive, the form does not wait. */
+  .login-art .brand { animation: rise .5s var(--ease) both; }
+  .login-art h2    { animation: rise .5s var(--ease) both .06s; }
+  .login-art p     { animation: rise .5s var(--ease) both .12s; }
+  .proof div       { animation: rise .5s var(--ease) both .18s; }
+  .proof div:nth-child(2) { animation-delay: .24s; }
+  .proof div:nth-child(3) { animation-delay: .3s; }
+  .login-art li    { animation: rise .5s var(--ease) both .34s; }
+  .login-art li:nth-child(2) { animation-delay: .4s; }
+  .login-art li:nth-child(3) { animation-delay: .46s; }
+  .login-box { animation: fade .4s var(--ease) both; }
+
+  /* Interaction feedback — the part of motion that is genuinely functional. */
+  button.btn:active { transform: translateY(1px); }
+  .card.click:active { transform: translateY(0); }
+  nav button, button.btn, .card.click, .pill { transition: all .15s var(--ease); }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .001ms !important;
+      animation-delay: 0ms !important;
+      transition-duration: .001ms !important;
+    }
+    /* A repeating animation crushed to .001ms still repeats, forever. The
+       ones that loop have to be switched off, not sped up. */
+    .ladder li.paid::after, .live .dot { animation: none !important; }
+    .ladder .rail i { height: 100% !important; }
+  }
+
+  @media (max-width: 1180px) {
+    :root { --sidebar: 200px; }
+    main { padding: 20px 20px 48px; }
+    header.top { padding: 0 20px; }
+  }
+
+  /* Below this the rail costs more than it gives; nav becomes a scroll strip. */
+  @media (max-width: 920px) {
+    /* Rows must be explicit. `.app` carries min-height:100vh, and a grid whose
+       rows are all `auto` stretches them to fill leftover space — so on a short
+       or empty page the top bar inflated to half the viewport. `auto 1fr` pins
+       the bar to its content and gives the slack to main instead. */
+    .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    aside {
+      position: sticky; top: 0; height: auto; z-index: 30;
+      flex-direction: row; align-items: center; gap: 4px;
+      padding-right: 8px; overflow: hidden;
+    }
+    aside .brand { padding: 12px 14px; flex: none; }
+    aside .brand b { font-size: 15px; }
+    aside .brand small { display: none; }
+    nav {
+      flex: 1 1 auto; min-width: 0;   /* min-width:0 or the flex item refuses to shrink and clips */
+      flex-direction: row; overflow-x: auto; padding: 8px 4px;
+      scrollbar-width: none; -webkit-overflow-scrolling: touch;
+      scroll-snap-type: x proximity;
+      /* The row scrolls, so say so: the last chip fades out at the edge rather
+         than being cut off mid-glyph, which reads as a bug. */
+      -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 26px), transparent);
+      mask-image: linear-gradient(90deg, #000 calc(100% - 26px), transparent);
+    }
+    nav::-webkit-scrollbar { display: none; }
+    nav button { white-space: nowrap; padding: 8px 11px; scroll-snap-align: start; }
+    .nav-foot { display: none; }
+    header.top { top: 56px; height: 54px; padding: 0 16px; gap: 10px; }
+    header.top h1 { font-size: 15px; }
+    .env { display: none; }          /* lives in the health check, not the chrome */
+    main { padding: 16px 16px 48px; }
+    section { margin-bottom: 20px; }
+    .two { grid-template-columns: 1fr; }
+    /* On a phone the green panel was pushing the actual sign-in button off the
+       bottom of the screen — the one thing a returning user came here to do.
+       The form is ordered first; the pitch keeps its place underneath, where
+       it reassures rather than obstructs. */
+    /* auto rows under min-height:100vh stretch to fill; pin the form to its
+       content and let the green panel take the slack. */
+    .login-wrap { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    /* .login-form centres its box on a row axis; the brand bar is a sibling of
+       that box, so the axis has to turn or it lands beside the form. */
+    .login-form {
+      order: 1; padding: 26px 20px 32px;
+      flex-direction: column; align-items: stretch; justify-content: flex-start;
+    }
+    .login-box { margin: 0 auto; width: 100%; }
+    .login-art  { order: 2; padding: 28px 24px 34px; }
+    .login-art .brand { display: none; }   /* the bar above the form carries it now */
+    .login-art h2 { font-size: clamp(26px, 7vw, 34px); margin: 0 0 12px; max-width: none; }
+    .login-art p { margin-bottom: 20px; font-size: 13.5px; }
+    /* The ladder sits below the form on a phone, so it costs nothing above the
+       fold and is the best thing on the panel. It stays. */
+    .ladder { padding-left: 26px; margin-top: 22px; }
+    .ladder ul { gap: 13px; }
+    .ladder li span { font-size: 13px; }
+    .proof { margin-bottom: 22px; padding-bottom: 22px; gap: 20px;
+             border-bottom: 1px solid rgba(255,255,255,.16); }
+    .proof b { font-size: 20px; }
+
+    /* The brand still has to be the first thing on screen, so it moves out of
+       the green panel and sits above the form as a compact bar. */
+    .login-form::before {
+      content: "ChaanBean"; display: block; font-weight: 800; font-size: 19px;
+      letter-spacing: -.02em; color: var(--green-700);
+      width: 100%; max-width: 372px; margin: 0 auto 22px;
+    }
+  }
+
+  /* Phone — one column, bigger touch targets, no wasted chrome. */
+  @media (max-width: 560px) {
+    aside .brand { padding: 12px 10px; }
+    .grid { grid-template-columns: 1fr; gap: 10px; }
+    .card { padding: 15px 16px; border-radius: 12px; }
+    .hero .fig { font-size: 32px; }
+    .hero { gap: 8px; }
+    .hero .delta { margin-left: 0 !important; text-align: left !important; }
+    .crumb { max-width: 14ch; }
+    th, td { padding: 10px 14px; }
+    /* Cells are nowrap, so a wide table scrolls inside its own box rather than
+       widening the page. Fade the right edge so it is clear there is more. */
+    .scroll {
+      -webkit-overflow-scrolling: touch;
+      -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 22px), transparent);
+      mask-image: linear-gradient(90deg, #000 calc(100% - 22px), transparent);
+    }
+    /* A tap target under 40px is a miss on a phone. */
+    nav button { padding: 10px 13px; font-size: 13px; }
+    button.btn.sm { padding: 8px 12px; }
+    .stat { font-size: 24px; }
+    main { padding: 14px 12px 40px; }
+
+    /* The gutter is no longer fixed — chartMetrics() narrows it on small
+       screens and the chart is built at the width it will occupy, so charts
+       now fit. Forcing a 460px minimum here made every card scroll sideways,
+       which is the worst way to read a bar chart on a phone. */
+
+    .login-art { padding: 24px 20px 22px; }
+    .login-art h2 { font-size: clamp(28px, 8vw, 34px); }
+    .proof { gap: 16px; }
+    .proof b { font-size: 18px; }
+    .proof span { font-size: 10.5px; }
+    .panel-head { flex-direction: column; align-items: flex-start; gap: 4px; }
+    h2 { font-size: 11px; }
+    .lede { font-size: 12.5px; }
+    /* iOS zooms the page when a focused input is under 16px. */
+    input { font-size: 16px; }
+  }
+
+  /* Very small phones — 320px class devices. */
+  @media (max-width: 380px) {
+    aside .brand b { font-size: 14px; }
+    nav button span { display: none; }
+    .crumb { max-width: 10ch; }
+  }
+
+  /* Charts keep their label column readable rather than scaling it away. */
+  @media (max-width: 640px) {
+    .chart { font-size: 11px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ------------------------------------------------------------------ login -->
+<div id="login" class="login-wrap">
+  <div class="login-art">
+    <div class="brand"><b>Chaan<span>Bean</span></b><small>Payment recovery, on rails</small></div>
+
+    <h2>Chase less.<br><em>Collect more.</em></h2>
+    <p>Your receivables, worked the way your best collections officer would work
+       them &#8212; patiently, in the right order, and without ever losing the thread.</p>
+
+    <div class="proof">
+      <div><b>24&#215;7</b><span>never forgets a follow-up</span></div>
+      <div><b>L1&#8202;&#8594;&#8202;L3</b><span>polite to firm, on its own</span></div>
+      <div><b>Zero</b><span>improvised words</span></div>
+    </div>
+
+    <!-- The ladder is the product in one glance: what happens, in what order,
+         and what it costs to keep ignoring it. Shown rather than described. -->
+    <div class="ladder">
+      <span class="rail"><i></i></span>
+      <ul>
+        <li><b>Day 0</b><span>A quiet SMS. Most invoices end here.</span></li>
+        <li><b>Day 3</b><span>A call, in the language they answer in.</span></li>
+        <li><b>Day 10</b><span>Firmer &#8212; and now it is on record.</span></li>
+        <li><b>Day 21</b><span>Legal wording. Approved, never improvised.</span></li>
+        <li class="paid"><b>Paid</b><span>Settled &#8212; and every step provable.</span></li>
+      </ul>
+    </div>
+  </div>
+  <div class="login-form">
+    <div class="login-box">
+      <h3 id="authTitle">Sign in</h3>
+      <p id="authLede">Operate campaigns, review refusals and approve legal content.</p>
+
+      <button class="btn google hidden" id="google" style="width:100%;padding:11px">
+        <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.4a5.5 5.5 0 0 1-2.4 3.6v3h3.9c2.3-2.1 3.6-5.2 3.6-8.8z"/><path fill="#34A853" d="M12 24c3.2 0 6-1.1 8-3l-3.9-3a7.2 7.2 0 0 1-10.7-3.8h-4v3.1A12 12 0 0 0 12 24z"/><path fill="#FBBC05" d="M5.3 14.2a7.1 7.1 0 0 1 0-4.6V6.5h-4a12 12 0 0 0 0 10.8l4-3.1z"/><path fill="#EA4335" d="M12 4.8c1.8 0 3.4.6 4.6 1.8l3.4-3.4A12 12 0 0 0 1.3 6.5l4 3.1A7.2 7.2 0 0 1 12 4.8z"/></svg>
+        <span>Continue with Google</span>
+      </button>
+      <div class="divider hidden" id="divider"><span>or</span></div>
+
+      <div class="field hidden" id="companyField">
+        <label class="f" for="company">Company name</label>
+        <input id="company" type="text" placeholder="Acme Steel Traders" autocomplete="organization">
+      </div>
+      <div class="field">
+        <label class="f" for="email">Work email</label>
+        <input id="email" type="email" placeholder="you@company.com" autocomplete="username">
+      </div>
+      <div class="field">
+        <label class="f" for="password">Password</label>
+        <input id="password" type="password" placeholder="••••••••" autocomplete="current-password">
+      </div>
+      <button class="btn primary" id="signin" style="width:100%;padding:11px">Sign in</button>
+      <div class="err" id="loginError"></div>
+      <p class="switch">
+        <span id="switchText">No account yet?</span>
+        <a href="#" id="switchMode">Create one</a>
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ---------------------------------------------------------------- console -->
+<div id="console" class="app hidden">
+  <aside>
+    <div class="brand"><b>Chaan<span>Bean</span></b><small>Payment recovery, on rails</small></div>
+    <nav id="nav"></nav>
+    <div class="nav-foot">
+      <b id="whoami">—</b>
+      <span id="envfoot">—</span>
+    </div>
+  </aside>
+
+  <div>
+    <header class="top">
+      <h1 id="viewTitle">Overview</h1>
+      <span class="crumb" id="companyName">—</span>
+      <span class="env" id="env"></span>
+      <span class="spacer"></span>
+      <button class="live on" id="liveToggle" title="Pause automatic refresh"
+              style="background:none;border:0;cursor:pointer">
+        <span class="dot"></span><span id="liveLabel">Live</span>
+      </button>
+      <button class="btn sm" id="refresh">Refresh</button>
+      <button class="btn sm" id="logout">Sign out</button>
+    </header>
+    <main id="view"></main>
+  </div>
+</div>
+
+<script>
+/* Plain-language meanings. A block reason shown as an enum name makes the
+   operator guess; this is the table that stops "why isn't it calling anyone"
+   becoming a support ticket. */
+const REASONS = {
+  CAMPAIGN_NOT_ACTIVE: "The campaign is not running.",
+  CONSENT_WITHDRAWN: "The buyer withdrew consent. Absolute — beats every other gate.",
+  BUYER_SUPPRESSED: "Inside a suppression window.",
+  ACCOUNT_IN_DISPUTE: "Disputed. All automated contact halts.",
+  ACCOUNT_CLOSED: "Settled or written off.",
+  ACCOUNT_NOT_OVERDUE: "Not yet overdue by the configured threshold.",
+  NO_VALID_PHONE: "No usable number on file.",
+  DND_REGISTERED: "Every number is on the DND registry.",
+  DND_UNKNOWN: "DND status never checked. Fails closed until scrubbed.",
+  DND_CHECK_STALE: "The DND scrub is older than 7 days.",
+  BLACKOUT_DATE: "A company no-call day.",
+  WEEKEND_NOT_PERMITTED: "Weekend calling is off for this campaign.",
+  OUTSIDE_CALLING_WINDOW: "Outside permitted hours in the campaign timezone.",
+  DAILY_CAP_REACHED: "The buyer's daily contact cap, across all campaigns.",
+  WEEKLY_CAP_REACHED: "The buyer's weekly contact cap.",
+  COOLDOWN_ACTIVE: "Too soon since the last contact with this person.",
+  NO_TEMPLATE_FOR_LEVEL: "No template configured for this level and channel.",
+  L3_TEMPLATE_NOT_APPROVED: "Legal content with no recorded approval. Never improvised.",
+  L3_REQUIRES_PRIOR_CONTACT: "Never actually reached at L2. Routed to a human, not a lawyer.",
+  CHANNEL_OPTED_OUT: "The buyer opted out of every usable channel.",
+  CHANNEL_CAP_REACHED: "Per-channel daily cap.",
+  NO_CONTACT_ADDRESS: "No address on file for any usable channel.",
+  SMS_TEMPLATE_NOT_REGISTERED: "No TRAI DLT registration for this SMS template.",
+  AUDIO_NOT_READY: "Speech synthesis failed. The call blocks rather than play silence.",
+  AUDIO_NOT_STAGED: "Audio is not on the telephony box with the expected byte size.",
+  CALLER_ID_NOT_APPROVED: "The caller ID is not carrier-approved.",
+  CONTACT_NOT_ALLOWLISTED: "Non-production refused to contact a real number.",
+};
+
+const ICON = {
+  overview: '<path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/>',
+  campaigns: '<path d="M3 11l18-8-8 18-2-8-8-2z"/>',
+  refusals: '<circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/>',
+  calls: '<path d="M22 16.9v3a2 2 0 01-2.2 2 19.8 19.8 0 01-8.6-3.1 19.5 19.5 0 01-6-6A19.8 19.8 0 012.1 4.2 2 2 0 014.1 2h3a2 2 0 012 1.7c.1 1 .4 1.9.7 2.8a2 2 0 01-.5 2.1L8.1 9.9a16 16 0 006 6l1.3-1.3a2 2 0 012.1-.4c.9.3 1.8.6 2.8.7a2 2 0 011.7 2z"/>',
+  messages: '<path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>',
+  ledger: '<path d="M4 3h12l4 4v14H4z"/><path d="M8 12h8M8 16h5"/>',
+  buyers: '<path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.9"/><path d="M16 3.1a4 4 0 010 7.8"/>',
+  profile: '<path d="M3 21V8l9-5 9 5v13"/><path d="M9 21v-6h6v6"/><path d="M9 11h.01M15 11h.01"/>',
+};
+const VIEWS = [
+  ["overview", "Overview"], ["buyers", "Credit buyers"], ["campaigns", "Campaigns"],
+  ["refusals", "Refusals"], ["calls", "Calls"], ["messages", "Messages"],
+  ["ledger", "Accounts"], ["profile", "Company"],
+];
+
+let token = localStorage.getItem("crp_token");
+let current = "overview";
+let cache = {};
+// Set while an operator has a form open. The 15-second poll must not repaint
+// the view underneath them — that would silently discard what they had typed.
+let formOpen = false;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c =>
+  ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+async function api(path, options = {}) {
+  const res = await fetch(`/api${path}`, {
+    ...options,
+    headers: { "Content-Type": "application/json",
+               ...(token ? { Authorization: `Bearer ${token}` } : {}),
+               ...(options.headers || {}) },
+  });
+  if (res.status === 401) { signOut(); throw new Error("Session expired"); }
+  if (!res.ok) {
+    // FastAPI buries the sentence worth showing inside {"detail": ...}, and a
+    // validation error inside a list of them. Showing raw JSON to an operator
+    // who typed a bad phone number is not an error message.
+    const raw = (await res.text()).slice(0, 600);
+    let msg = raw;
+    try {
+      const body = JSON.parse(raw);
+      const d = body.detail ?? body;
+      msg = Array.isArray(d)
+        ? d.map(e => e.msg || JSON.stringify(e)).join("; ")
+        : (typeof d === "string" ? d : JSON.stringify(d));
+    } catch { /* not JSON; the raw text is the best we have */ }
+    throw new Error(msg.slice(0, 240));
+  }
+  return res.json();
+}
+
+function pill(text, kind = "") {
+  return `<span class="pill ${kind} dot">${esc(text)}</span>`;
+}
+function statusPill(s) {
+  const bad = ["FAILED","BLOCKED","NO_ANSWER","BUSY","UNKNOWN","PAUSED"];
+  const ok  = ["ANSWERED","DELIVERED","SENT","READ","ACTIVE","PAID","SETTLED"];
+  return pill(s, bad.includes(s) ? "bad" : ok.includes(s) ? "ok" : "warn");
+}
+const yn = (v) => `<span class="yn ${v ? "y" : "n"}">${v ? "Yes" : "No"}</span>`;
+
+/* ------------------------------------------------------------------ charts
+   Hand-rolled inline SVG. No chart library: four small horizontal bar forms
+   is less code than configuring one, and it keeps the page dependency-free.
+
+   Shared mark spec — 4px rounded data-ends anchored to the baseline, a 2px
+   surface gap between touching marks, recessive tracks, no gridlines, and
+   labels placed selectively rather than on every bar. */
+const BAR_H = 26, BAR_GAP = 10, PAD_L = 132, PAD_R = 92;
+
+/* Charts are drawn in user units that are meant to equal CSS pixels. If a
+   560-unit chart is poured into a 300px phone column, preserveAspectRatio
+   scales *everything* by 0.55 — including the 12px type, which lands at about
+   7px. The bars may shrink; the labels may not. So build each chart at the
+   width it will actually occupy, and buy the plot area back by trimming the
+   gutters rather than the text. */
+function chartMetrics(width) {
+  if (!width) {
+    // First-pass estimate only. The real width is not knowable until the
+    // markup is in the document — a chart inside a `.two` column occupies half
+    // of this — so fitCharts() corrects it immediately after insertion.
+    const host = document.getElementById("view");
+    const avail = (host && host.clientWidth ? host.clientWidth : 560) - 48;
+    width = Math.max(250, Math.min(760, avail));
+  }
+  const narrow = width < 430;
+  return {
+    width,
+    narrow,
+    // Long reason codes cannot wrap in SVG, so they are clipped to fit the
+    // gutter. The full text stays in the <title>, which is the tooltip.
+    labelMax: narrow ? 13 : 0,
+  };
+}
+
+function clip(text, max) {
+  return max && text.length > max ? text.slice(0, max - 1) + "…" : text;
+}
+
+/* Gutters have to be measured, not guessed. A fixed right gutter is fine for
+   "1284" and hopeless for "₹1,31,00,000" — and this product deliberately
+   prints crore in full, so the long case is the normal case. SVG text cannot
+   wrap or ellipsise itself, so anything that does not fit is simply painted
+   outside the chart and clipped by the card. */
+const CH_LBL = 6.6, CH_VAL = 7.2;   // ~advance width of 12px Inter, by weight
+
+function gutters(width, labels, values, { narrow }) {
+  const longest = (xs) => xs.reduce((n, x) => Math.max(n, String(x).length), 0);
+  const wantL = longest(labels) * CH_LBL + 22;
+  const wantR = longest(values) * CH_VAL + 16;
+  // Never let the gutters starve the plot: the bars are the chart.
+  const padL = Math.round(Math.min(width * (narrow ? 0.40 : 0.34), Math.max(56, wantL)));
+  const padR = Math.round(Math.min(width * (narrow ? 0.36 : 0.28), Math.max(36, wantR)));
+  return { padL, padR };
+}
+
+function hBars(rows, { hue = "var(--mark)", width, showTrack = true } = {}) {
+  if (!rows.length) return `<p class="hint">Nothing to show yet.</p>`;
+  const m = chartMetrics(width);
+  width = m.width;
+  const { padL: PAD_L, padR: PAD_R } = gutters(
+    width,
+    rows.map(r => clip(r.label, m.labelMax)),
+    rows.map(r => r.display ?? r.value),
+    m,
+  );
+  const max = Math.max(...rows.map(r => r.value), 1);
+  const plotW = width - PAD_L - PAD_R;
+  const height = rows.length * (BAR_H + BAR_GAP);
+
+  const bars = rows.map((r, i) => {
+    const y = i * (BAR_H + BAR_GAP);
+    // 2px inset keeps a surface gap between adjacent marks; white does the
+    // separating rather than a border drawn around them.
+    const h = BAR_H - 2;
+    const w = Math.max(r.value > 0 ? 3 : 0, (r.value / max) * plotW);
+    const fill = r.color || hue;
+    return `<g>
+      <title>${esc(r.label)}: ${esc(r.display ?? r.value)}</title>
+      <rect class="hit" x="0" y="${y}" width="${width}" height="${BAR_H + BAR_GAP}"/>
+      <text class="lbl" x="${PAD_L - 12}" y="${y + h / 2 + 4}" text-anchor="end">${esc(clip(r.label, m.labelMax))}</text>
+      ${showTrack ? `<rect class="track" x="${PAD_L}" y="${y + 1}" width="${plotW}" height="${h}" rx="4"/>` : ""}
+      <rect class="mark" x="${PAD_L}" y="${y + 1}" width="${w}" height="${h}" rx="4" style="fill:${fill}"/>
+      <text class="val" x="${PAD_L + plotW + 10}" y="${y + h / 2 + 4}">${esc(r.display ?? r.value)}</text>
+    </g>`;
+  }).join("");
+
+  const spec = esc(JSON.stringify({ kind: "hbars", rows, opts: { hue, showTrack } }));
+  return `<svg class="chart" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}"
+    preserveAspectRatio="xMinYMin meet" role="img" data-spec="${spec}">
+    ${bars}</svg>`;
+}
+
+/* A funnel is successive subsets of one number, so it is one hue at
+   decreasing width — not four categories. Drop-off is annotated because that
+   is the thing worth reading. */
+function funnel(stages, width) {
+  const m = chartMetrics(width);
+  width = m.width;
+  const { padL: PAD_L, padR: PAD_R } = gutters(
+    width,
+    stages.map(s => clip(s.label, m.labelMax)),
+    // The drop-off sits under the value, so the gutter must fit whichever of
+    // the two is wider.
+    stages.map((s, i) => {
+      const lost = i > 0 ? stages[i - 1].value - s.value : 0;
+      return String(s.value).length >= String(lost).length + 1 ? s.value : `-${lost}`;
+    }),
+    m,
+  );
+  const max = Math.max(stages[0]?.value || 1, 1);
+  const plotW = width - PAD_L - PAD_R;
+  const height = stages.length * (BAR_H + BAR_GAP);
+  const bars = stages.map((s, i) => {
+    const y = i * (BAR_H + BAR_GAP), h = BAR_H - 2;
+    const w = Math.max(s.value > 0 ? 3 : 0, (s.value / max) * plotW);
+    const pct = max ? Math.round((s.value / max) * 100) : 0;
+    const lost = i > 0 ? stages[i - 1].value - s.value : 0;
+    return `<g>
+      <title>${esc(s.label)}: ${s.value} of ${max} (${pct}%)</title>
+      <rect class="hit" x="0" y="${y}" width="${width}" height="${BAR_H + BAR_GAP}"/>
+      <text class="lbl" x="${PAD_L - 12}" y="${y + h / 2 + 4}" text-anchor="end">${esc(clip(s.label, m.labelMax))}</text>
+      <rect class="track" x="${PAD_L}" y="${y + 1}" width="${plotW}" height="${h}" rx="4"/>
+      <rect class="mark" x="${PAD_L}" y="${y + 1}" width="${w}" height="${h}" rx="4"/>
+      <text class="val" x="${PAD_L + plotW + 10}" y="${y + h / 2 + 4}">${s.value}</text>
+      ${lost > 0 ? `<text class="sub" x="${PAD_L + plotW + 10}" y="${y + h / 2 + 17}">−${lost}</text>` : ""}
+    </g>`;
+  }).join("");
+  const spec = esc(JSON.stringify({ kind: "funnel", stages }));
+  return `<svg class="chart" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}"
+    preserveAspectRatio="xMinYMin meet" role="img" data-spec="${spec}">${bars}</svg>`;
+}
+
+/* Every chart ships a table view — identity and value must be reachable
+   without relying on the picture. */
+function tableView(head, rows) {
+  return `<details class="tableview"><summary>Table view</summary>
+    <table><thead><tr>${head.map(h => `<th>${esc(h)}</th>`).join("")}</tr></thead>
+    <tbody>${rows.map(r => `<tr>${r.map(c => `<td>${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody>
+    </table></details>`;
+}
+
+function table(head, rows, emptyMsg) {
+  if (!rows.length) return `<div class="panel"><div class="empty">${esc(emptyMsg)}</div></div>`;
+  return `<div class="panel"><div class="scroll"><table>
+    <thead><tr>${head.map(h => `<th${h.num ? ' class="num"' : ""}>${esc(h.label ?? h)}</th>`).join("")}</tr></thead>
+    <tbody>${rows.join("")}</tbody></table></div></div>`;
+}
+
+/* ------------------------------------------------------------------- views */
+const RENDER = {
+  overview(d) {
+    const { summary, reports } = d;
+    const r = reports || {};
+    const voice = r.contact?.voice || {};
+    const ageing = r.ageing || { buckets: {}, invoice_counts: {} };
+    const lvl = r.funnel?.levels || summary.escalation_levels || {};
+    const review = r.funnel?.awaiting_human_review ?? 0;
+    const recovery = r.recovery || {};
+    const refused = Object.values(summary.block_reasons).reduce((a, b) => a + b, 0);
+
+    const AGE = [
+      ["CURRENT", "Not yet due", "var(--age-0)"],
+      ["B1_30",   "1–30 days",   "var(--age-1)"],
+      ["B31_60",  "31–60 days",  "var(--age-2)"],
+      ["B61_90",  "61–90 days",  "var(--age-3)"],
+      ["B90_PLUS","90+ days",    "var(--age-4)"],
+    ];
+    const ageRows = AGE.map(([key, label, color]) => ({
+      label, color,
+      value: ageing.buckets?.[key]?.paise ?? 0,
+      display: ageing.buckets?.[key]?.display ?? "₹0",
+      count: ageing.invoice_counts?.[key] ?? 0,
+    }));
+    const worst = ageRows.slice(2).reduce((a, b) => a + b.value, 0);
+    const totalAged = ageRows.reduce((a, b) => a + b.value, 0) || 1;
+
+    const stages = [
+      { label: "Placed",       value: voice.placed ?? 0 },
+      { label: "Connected",    value: voice.connected ?? 0 },
+      { label: "Delivered",    value: voice.delivered ?? 0 },
+      { label: "Acknowledged", value: voice.acknowledged ?? 0 },
+    ];
+
+    const LADDER_LABEL = { L1: "L1 · courtesy", L2: "L2 · firm", L3: "L3 · legal" };
+    const ladder = ["L1", "L2", "L3"].map(l => ({ label: LADDER_LABEL[l], value: lvl[l] ?? 0 }));
+
+    // Sentence case for readability, but L1/L2/L3 and DND stay upper — they are
+    // names, and "l3 template" reads as a typo.
+    const humanise = (r) => r.toLowerCase().replace(/_/g, " ")
+      .replace(/\b(l1|l2|l3|dnd|sms)\b/g, m => m.toUpperCase())
+      .replace(/^./, c => c.toUpperCase());
+    const blocks = Object.entries(summary.block_reasons)
+      .sort((a, b) => b[1] - a[1]).slice(0, 6)
+      .map(([reason, n]) => ({ label: humanise(reason), value: n }));
+
+    const msg = r.contact?.messaging || {};
+    const msgRows = Object.entries(msg).map(([ch, v]) =>
+      [ch, v.sent, v.delivered, v.read]);
+
+    return `
+    <section>
+      <div class="card" style="padding:22px 24px">
+        <div class="hero">
+          <div>
+            <div class="label" style="margin:0 0 2px">Outstanding, overdue</div>
+            <div class="fig">${esc(summary.outstanding_display)}</div>
+          </div>
+          <div class="delta" style="margin-left:auto;text-align:right">
+            <div><b>${esc(recovery.collected?.display ?? "₹0")}</b> collected in ${recovery.window_days ?? 90} days</div>
+            <div>${recovery.accounts_settled ?? 0} account${(recovery.accounts_settled ?? 0) === 1 ? "" : "s"} settled</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="grid">
+        <div class="card click" data-go="calls"><div class="stat">${voice.placed ?? 0}</div>
+          <div class="label">Calls placed</div></div>
+        <div class="card click" data-go="calls"><div class="stat">${voice.delivered ?? 0}</div>
+          <div class="label">Delivered to a human</div>
+          <div class="hint">Answered <em>and</em> played through. A machine answering is not a delivery.</div></div>
+        <div class="card click" data-go="refusals"><div class="stat">${refused}</div>
+          <div class="label">Refused, with a reason</div></div>
+        <div class="card click" data-go="ledger"><div class="stat">${review}</div>
+          <div class="label">Awaiting human review</div>
+          <div class="hint">Thresholds met but never actually reached. These go to a person, not a lawyer.</div></div>
+      </div>
+    </section>
+
+    <section class="two">
+      <div class="card">
+        <div class="panel-head" style="padding:0 0 14px;border:0">
+          <div><h3>Outstanding by age</h3>
+          <p>${Math.round((worst / totalAged) * 100)}% of the book is more than 30 days past due</p></div>
+        </div>
+        ${hBars(ageRows)}
+        <div class="legend">${AGE.map(([, label, c]) =>
+          `<span><i style="background:${c}"></i>${label}</span>`).join("")}</div>
+        ${tableView(["Bucket", "Outstanding", "Invoices"],
+          ageRows.map(x => [x.label, x.display, x.count]))}
+      </div>
+
+      <div class="card">
+        <div class="panel-head" style="padding:0 0 14px;border:0">
+          <div><h3>What actually reached someone</h3>
+          <p>Each stage is a subset of the one above it, never a separate count</p></div>
+        </div>
+        ${funnel(stages)}
+        <p class="hint">A call answered at second 0 and dropped at second 2 of a 22-second
+          message counts as connected and delivered nothing. That gap is the drop
+          between the second and third bars.</p>
+        ${tableView(["Stage", "Calls"], stages.map(s => [s.label, s.value]))}
+      </div>
+    </section>
+
+    <section class="two">
+      <div class="card">
+        <div class="panel-head" style="padding:0 0 14px;border:0">
+          <div><h3>Escalation ladder</h3>
+          <p>L3 is reached only after a delivered contact at L2</p></div>
+        </div>
+        ${hBars(ladder)}
+        ${tableView(["Level", "Accounts"], ladder.map(l => [l.label, l.value]))}
+      </div>
+
+      <div class="card">
+        <div class="panel-head" style="padding:0 0 14px;border:0">
+          <div><h3>Top reasons for refusing</h3>
+          <p>A campaign that looks idle is explained here, not guessed at</p></div>
+        </div>
+        ${hBars(blocks)}
+        ${blocks.length ? `<p class="hint">${esc(REASONS[Object.entries(summary.block_reasons)
+            .sort((a,b)=>b[1]-a[1])[0][0]] || "")}</p>` : ""}
+        ${tableView(["Reason", "Count"], blocks.map(b => [b.label, b.value]))}
+      </div>
+    </section>
+
+    ${msgRows.length ? `<section>
+      <h2>Messaging</h2>
+      ${table(["Channel", {label:"Sent",num:1}, {label:"Delivered",num:1}, {label:"Read",num:1}],
+        msgRows.map(([ch, s, dv, rd]) => `<tr><td>${pill(ch)}</td>
+          <td class="num">${s}</td><td class="num">${dv}</td><td class="num">${rd}</td></tr>`),
+        "No messages yet.")}
+    </section>` : ""}`;
+  },
+
+  campaigns(d) {
+    const rows = (d.campaigns || []).map((c) => {
+      const p = c.progress || {};
+      const done = p.targets ? Math.round(((p.calls || 0) / p.targets) * 100) : 0;
+      const action = c.status === "ACTIVE"
+        ? `<button class="btn sm" data-pause="${c.id}">Pause</button>`
+        : `<button class="btn sm primary" data-start="${c.id}">Start</button>`;
+      return `<tr>
+        <td><b>${esc(c.name)}</b></td>
+        <td>${statusPill(c.status)}</td>
+        <td>${(c.channels || []).map(ch => pill(ch)).join(" ")}</td>
+        <td class="num">${p.targets ?? 0}</td>
+        <td class="num">${p.calls ?? 0}</td>
+        <td class="num">${p.blocked ?? 0}</td>
+        <td><div class="bar"><i style="width:${Math.min(100, done)}%"></i></div></td>
+        <td>${action}</td></tr>`;
+    });
+    return `<section><h2>Campaigns</h2>
+      <p class="lede">Starting a campaign enrols every eligible buyer and seeds their next action.
+        One active campaign owns a buyer at a time, so two campaigns cannot combine to exceed a cap.</p>
+      ${table(["Name","Status","Channels",{label:"Targets",num:1},{label:"Calls",num:1},{label:"Blocked",num:1},"Progress",""], rows, "No campaigns yet.")}
+    </section>`;
+  },
+
+  refusals(d, embedded) {
+    const entries = Object.entries(d.summary.block_reasons).sort((a, b) => b[1] - a[1]);
+    const total = entries.reduce((a, [, n]) => a + n, 0) || 1;
+    const rows = entries.map(([reason, n]) => `<tr>
+      <td>${pill(reason, "bad")}</td>
+      <td class="num"><b>${n}</b></td>
+      <td style="width:130px"><div class="bar"><i style="width:${(n / total) * 100}%"></i></div></td>
+      <td class="wrap">${esc(REASONS[reason] || "")}</td></tr>`);
+    return `<section><h2>Why calls were refused</h2>
+      ${embedded ? "" : '<p class="lede">Every refusal is recorded with a machine-readable reason. A campaign that looks idle is explained here, not guessed at.</p>'}
+      ${table(["Reason",{label:"Count",num:1},"Share","What it means"], rows, "Nothing refused yet.")}
+      ${embedded ? '<p class="hint" style="margin-left:2px">A refusal is not a failure — it is the system declining to make a call it could not justify.</p>' : ""}
+    </section>`;
+  },
+
+  calls(d) {
+    const rows = (d.calls || []).map(c => `<tr>
+      <td>${pill(c.level)}</td>
+      <td>${esc(c.to_e164 || "—")}</td>
+      <td>${statusPill(c.block_reason || c.status)}</td>
+      <td>${yn(c.connected)}</td><td>${yn(c.delivered)}</td><td>${yn(c.acknowledged)}</td>
+      <td class="num">${c.duration_sec ?? "—"}</td>
+      <td class="num">${c.hangup_cause ?? "—"}</td></tr>`);
+    return `<section><h2>Recent calls</h2>
+      <p class="lede"><b>Connected</b>, <b>delivered</b> and <b>acknowledged</b> are three separate facts and are never
+        collapsed into one. A call answered at second 0 and dropped at second 2 of a 22-second
+        message connected and delivered nothing.</p>
+      ${table(["Level","Number","Status","Connected","Delivered","Acknowledged",{label:"Secs",num:1},{label:"Q.850",num:1}], rows, "No calls yet.")}
+    </section>`;
+  },
+
+  messages(d) {
+    const rows = (d.messages || []).map(m => `<tr>
+      <td>${pill(m.channel)}</td><td>${pill(m.level)}</td>
+      <td>${esc(m.to_address)}</td><td>${statusPill(m.status)}</td>
+      <td>${yn(m.sent)}</td><td>${yn(m.delivered)}</td><td>${yn(m.read)}</td></tr>`);
+    return `<section><h2>Recent messages</h2>
+      <p class="lede">Sent, delivered and read are kept apart for the same reason as voice —
+        one "delivered" number would overstate what actually reached the debtor.</p>
+      ${table(["Channel","Level","To","Status","Sent","Delivered","Read"], rows, "No messages yet.")}
+    </section>`;
+  },
+
+  ledger(d) {
+    const rows = (d.accounts || []).map(a => `<tr>
+      <td>${esc(a.invoice_ref || "—")}</td>
+      <td class="num"><b>${esc(a.outstanding_display)}</b></td>
+      <td class="num">${a.days_past_due}</td>
+      <td>${statusPill(a.status)}</td>
+      <td>${a.level ? pill(a.level) : "—"}</td></tr>`);
+    return `<section><h2>Accounts</h2>
+      <p class="lede">Amounts are integer paise throughout, displayed in the Indian numbering
+        system — <b>₹42,00,000</b>, never ₹4,200,000.</p>
+      ${table(["Invoice",{label:"Outstanding",num:1},{label:"Days past due",num:1},"Status","Level"], rows, "No accounts yet.")}
+    </section>`;
+  },
+
+  /* ------------------------------------------------------- credit buyers */
+  buyers(d) {
+    const rows = (d.buyers || []).map(b => {
+      // A buyer with no number cannot be called at all, and a buyer whose only
+      // numbers are unscrubbed will be refused at dial time. Both are worth
+      // seeing here rather than discovering when the campaign runs.
+      const phones = b.phones || [];
+      const dialable = phones.filter(p => p.dnd_status === "CLEAR").length;
+      let reach;
+      if (!phones.length)      reach = pill("No number", "bad");
+      else if (!dialable)      reach = pill(`${phones.length} unscrubbed`, "warn");
+      else                     reach = pill(`${dialable} reachable`, "ok");
+      return `<tr>
+        <td><b>${esc(b.name)}</b>${b.external_ref ? `<div class="sub">${esc(b.external_ref)}</div>` : ""}</td>
+        <td>${phones.length ? esc(phones[0].e164) : "—"}</td>
+        <td>${reach}</td>
+        <td class="num"><b>${esc(b.outstanding_display)}</b></td>
+        <td class="num">${b.days_past_due || "—"}</td>
+        <td>${b.consent_withdrawn ? pill("Withdrawn", "bad") : esc(b.language)}</td>
+        <td><button class="btn sm" data-credit="${b.id}" data-name="${esc(b.name)}">Check credit</button></td>
+      </tr>`;
+    });
+
+    return `<section>
+      <div class="panel-head">
+        <div><h3>Credit buyers</h3>
+          <p>Everyone who owes you money. One conversation per buyer, however many invoices.</p></div>
+        <button class="btn sm" data-toggle="addBuyer">Add a buyer</button>
+      </div>
+
+      <form id="addBuyer" class="card addform" hidden>
+        <div class="formgrid">
+          <div class="field"><label for="nbName">Business or person</label>
+            <input id="nbName" required maxlength="200" placeholder="Kumar Traders"></div>
+          <div class="field"><label for="nbPhone">Mobile number</label>
+            <input id="nbPhone" placeholder="98765 43210" inputmode="tel">
+            <div class="hint">Typed however you like &#8212; stored dialable.</div></div>
+          <div class="field"><label for="nbPhone2">Another number <span>optional</span></label>
+            <input id="nbPhone2" placeholder="044 2851 4000" inputmode="tel"></div>
+          <div class="field"><label for="nbLang">Language</label>
+            <select id="nbLang">
+              <option value="en-IN">English</option>
+              <option value="hi-IN">Hindi</option>
+              <option value="ta-IN">Tamil</option>
+              <option value="te-IN">Telugu</option>
+              <option value="kn-IN">Kannada</option>
+              <option value="ml-IN">Malayalam</option>
+              <option value="mr-IN">Marathi</option>
+              <option value="gu-IN">Gujarati</option>
+              <option value="bn-IN">Bengali</option>
+            </select></div>
+          <div class="field"><label for="nbEmail">Email <span>optional</span></label>
+            <input id="nbEmail" type="email" placeholder="accounts@kumartraders.in"></div>
+          <div class="field"><label for="nbRef">Your reference <span>optional</span></label>
+            <input id="nbRef" maxlength="100" placeholder="Their id in your books"></div>
+        </div>
+
+        <div class="subhead">What they owe <span>optional &#8212; you can add invoices later</span></div>
+        <div class="formgrid">
+          <div class="field"><label for="nbAmount">Amount outstanding</label>
+            <input id="nbAmount" inputmode="decimal" placeholder="4,28,600">
+            <div class="hint">Indian grouping is read correctly &#8212; <b>4,50,000</b> is four lakh
+              fifty thousand, not forty-five thousand.</div></div>
+          <div class="field"><label for="nbDue">Due date</label>
+            <input id="nbDue" type="date">
+            <div class="hint">Ageing and the escalation ladder are both measured from this.</div></div>
+          <div class="field"><label for="nbInv">Invoice number <span>optional</span></label>
+            <input id="nbInv" maxlength="100" placeholder="INV-2026-0412"></div>
+        </div>
+        <div class="err" id="nbErr"></div>
+        <div class="formactions">
+          <button type="submit" class="btn primary">Add buyer</button>
+          <button type="button" class="btn" data-toggle="addBuyer">Cancel</button>
+        </div>
+        <p class="hint">A new number is recorded as <b>DND unknown</b> until a scrub says
+          otherwise, and until then the policy engine will not call it. That is deliberate.</p>
+      </form>
+
+      ${table(["Buyer","Primary number","Reachable",{label:"Outstanding",num:1},
+               {label:"Days overdue",num:1},"Language","Credit"], rows,
+              "No buyers yet. Add one above, or import a CSV.")}
+      <div id="creditPanel"></div>
+    </section>`;
+  },
+
+  /* ----------------------------------------------- the creditor's profile */
+  profile(d) {
+    const p = d.profile;
+    if (!p) return `<div class="panel"><div class="empty">Loading&#8230;</div></div>`;
+    return `<section>
+      <div class="panel-head">
+        <div><h3>Your company</h3>
+          <p>The creditor of record &#8212; this is the name a debtor is told is calling.</p></div>
+      </div>
+
+      <div class="grid">
+        <div class="card"><div class="stat">${p.buyer_count}</div>
+          <div class="label">Credit buyers on file</div></div>
+        <div class="card"><div class="stat">${esc(p.outstanding_display)}</div>
+          <div class="label">Outstanding across them</div></div>
+        <div class="card"><div class="stat">${(p.caller_ids || []).length}</div>
+          <div class="label">Approved caller IDs</div></div>
+      </div>
+
+      <form id="profileForm" class="card addform">
+        <div class="formgrid">
+          <div class="field"><label for="pfName">Registered legal name</label>
+            <input id="pfName" required maxlength="300" value="${esc(p.legal_name || p.company_name || "")}">
+            <div class="hint">Used verbatim in legal notices, so it must match your registration.</div></div>
+          <div class="field"><label for="pfGstin">GSTIN <span>optional</span></label>
+            <input id="pfGstin" maxlength="15" value="${esc(p.gstin || "")}" placeholder="33AABCS1429B1ZQ"></div>
+          <div class="field"><label for="pfCin">CIN <span>optional</span></label>
+            <input id="pfCin" maxlength="21" value="${esc(p.cin || "")}"></div>
+          <div class="field"><label for="pfState">State code <span>optional</span></label>
+            <input id="pfState" maxlength="2" value="${esc(p.state_code || "")}" placeholder="33"></div>
+          <div class="field wide"><label for="pfAddr">Registered address <span>optional</span></label>
+            <input id="pfAddr" value="${esc(p.registered_address || "")}" placeholder="12 Mount Road, Chennai 600002"></div>
+        </div>
+        <div class="err" id="pfErr"></div>
+        <div class="formactions"><button type="submit" class="btn primary">Save company details</button></div>
+      </form>
+
+      <div class="panel-head" style="margin-top:22px">
+        <div><h3>Caller IDs</h3>
+          <p>Indian carriers reject an unapproved CLI outright, so these are held as
+             rows with their approval state rather than assumed.</p></div>
+      </div>
+      ${table(["Number","Carrier approved","Default"],
+        (p.caller_ids || []).map(c => `<tr>
+          <td>${esc(c.e164)}</td>
+          <td>${c.carrier_approved ? pill("Approved","ok") : pill("Pending","warn")}</td>
+          <td>${c.is_default ? pill("Default") : "&#8212;"}</td></tr>`),
+        "No caller ID yet — calls cannot be placed until your carrier approves one.")}
+    </section>`;
+  },
+};
+
+/* ------------------------------------------------------------------- wiring */
+function renderNav() {
+  $("nav").innerHTML = VIEWS.map(([key, label]) => `
+    <button data-view="${key}" aria-current="${key === current}">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
+           stroke-linecap="round" stroke-linejoin="round">${ICON[key]}</svg>
+      ${label}
+    </button>`).join("");
+  document.querySelectorAll("[data-view]").forEach(b => b.onclick = () => {
+    current = b.dataset.view; formOpen = false; renderNav(); paint({ force: true }); load({ listOnly: true });
+  });
+}
+
+let lastPainted = "";
+
+/* A chart's real width is only knowable once it is in the document: the same
+   markup sits full-width on one view and in a half-width `.two` column on
+   another. Building it at a guessed width and letting CSS scale the SVG down
+   shrinks the 12px type along with the bars — which is the whole problem. So
+   measure each chart against the box it actually landed in and rebuild any
+   that guessed wrong. One corrective pass; the rebuilt chart matches, so it
+   does not run again. */
+function fitCharts() {
+  document.querySelectorAll("svg.chart[data-spec]").forEach(svg => {
+    const host = svg.parentElement;
+    if (!host) return;
+    const cs = getComputedStyle(host);
+    const avail = Math.floor(
+      host.clientWidth - parseFloat(cs.paddingLeft || 0) - parseFloat(cs.paddingRight || 0)
+    );
+    const vb = parseFloat(svg.getAttribute("viewBox").split(" ")[2]);
+    const target = Math.max(250, avail);
+    if (!avail || Math.abs(target - vb) < 4) return;   // already correct
+    let spec;
+    try { spec = JSON.parse(svg.dataset.spec); } catch { return; }
+    svg.outerHTML = spec.kind === "funnel"
+      ? funnel(spec.stages, target)
+      : hBars(spec.rows, { ...spec.opts, width: target });
+  });
+}
+
+function paint({ force = false } = {}) {
+  $("viewTitle").textContent = (VIEWS.find(v => v[0] === current) || [])[1] || "Overview";
+  const html = RENDER[current](cache);
+
+  // A poll that repaints unchanged markup every 15 seconds would collapse any
+  // open table view, drop hover state and flicker the charts. Only touch the
+  // DOM when the output actually differs.
+  if (!force && formOpen) return;   // never repaint under an open form
+  if (!force && html === lastPainted) return;
+
+  // When it does differ, carry the disclosure state across — the operator
+  // opened those panels and the refresh is not a reason to close them.
+  const open = [...$("view").querySelectorAll("details")].map(d => d.open);
+  $("view").innerHTML = html;
+  lastPainted = html;
+  $("view").querySelectorAll("details").forEach((d, i) => { if (open[i]) d.open = true; });
+  document.querySelectorAll("[data-start]").forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    await api(`/campaigns/${b.dataset.start}/enrol`, { method: "POST" });
+    await api(`/campaigns/${b.dataset.start}/start`, { method: "POST" });
+    load();
+  });
+  document.querySelectorAll("[data-pause]").forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    await api(`/campaigns/${b.dataset.pause}/pause`, { method: "POST" });
+    load();
+  });
+  // Tiles drill through to the view that explains them.
+  document.querySelectorAll("[data-go]").forEach(el => el.onclick = () => {
+    current = el.dataset.go; formOpen = false; renderNav(); paint({ force: true }); load({ listOnly: true }); window.scrollTo({ top: 0 });
+  });
+  wireForms();
+  wireCredit();
+  fitCharts();
+}
+
+/* ------------------------------------------------------- credit eligibility
+   The result is shown with every factor that produced it, and the operator
+   still types the limit they are granting. Presenting a single verdict with a
+   "Approve" button next to it would be a different product, and a worse one:
+   the number that matters is the one a person chose, knowing why. */
+function creditForm(buyerId, name) {
+  return `<div class="card addform" id="creditCard">
+    <div class="panel-head">
+      <div><h3>Credit check &#8212; ${esc(name)}</h3>
+        <p>A recommendation and its reasons. You decide the limit.</p></div>
+      <button class="btn sm" id="creditClose">Close</button>
+    </div>
+    <form id="creditForm">
+      <div class="formgrid">
+        <div class="field"><label for="ccLimit">Credit limit requested</label>
+          <input id="ccLimit" inputmode="decimal" placeholder="5,00,000" required></div>
+        <div class="field"><label for="ccTurnover">Annual turnover <span>declared</span></label>
+          <input id="ccTurnover" inputmode="decimal" placeholder="2,00,00,000"></div>
+        <div class="field"><label for="ccYears">Years trading</label>
+          <input id="ccYears" type="number" step="0.5" min="0" max="200" placeholder="6"></div>
+        <div class="field"><label for="ccOther">Owed to other creditors <span>declared</span></label>
+          <input id="ccOther" inputmode="decimal" placeholder="3,00,000"></div>
+        <div class="field"><label for="ccRefs">Trade references</label>
+          <input id="ccRefs" type="number" min="0" max="99" value="0"></div>
+        <div class="field"><label for="ccGst">GST registered</label>
+          <select id="ccGst">
+            <option value="">Not stated</option>
+            <option value="yes">Yes</option>
+            <option value="no">No</option>
+          </select></div>
+        <div class="field wide"><label for="ccNotes">Notes <span>optional</span></label>
+          <input id="ccNotes" maxlength="500" placeholder="Anything a reviewer should know"></div>
+      </div>
+      <label class="check"><input type="checkbox" id="ccVerified">
+        <span>Turnover verified against a GST return or bank statement
+          &#8212; roughly doubles the weight it carries, so only tick it if
+          someone has actually seen the document.</span></label>
+      <div class="err" id="ccErr"></div>
+      <div class="formactions">
+        <button type="submit" class="btn primary">Run the check</button>
+      </div>
+      <p class="hint">What they already owe you is taken from your own ledger, not
+        from this form. Declared figures are the buyer&#8217;s claims and are weighted
+        accordingly.</p>
+    </form>
+    <div id="creditResult"></div>
+  </div>`;
+}
+
+const REC_KIND = { STRONG: "ok", ACCEPTABLE: "ok", CAUTION: "warn", REFER: "bad" };
+
+function creditResult(a) {
+  // Biggest movers first: an operator reading three lines should be reading the
+  // three that decided it.
+  const ranked = [...(a.factors || [])].sort(
+    (x, y) => Math.abs(y.contribution) - Math.abs(x.contribution));
+  const blockers = (a.blockers || []).length ? `
+    <div class="blockers">
+      <b>Why this needs a person</b>
+      <ul>${a.blockers.map(b => `<li>${esc(b)}</li>`).join("")}</ul>
+    </div>` : "";
+
+  return `<div class="result">
+    <div class="reshead">
+      ${pill(a.recommendation, REC_KIND[a.recommendation] || "warn")}
+      <div><b>${esc(a.suggested_limit_display)}</b>
+        <span>suggested &#8212; ${esc(a.requested_limit_display)} requested</span></div>
+      <div class="score"><b>${a.score}</b><span>strength / 100</span></div>
+    </div>
+    ${blockers}
+    <div class="why">
+      <b>Every factor that produced this</b>
+      <table class="factors"><tbody>
+        ${ranked.map(f => `<tr>
+          <td>${esc(f.explanation)}</td>
+          <td class="num">${f.contribution >= 0 ? "+" : ""}${f.contribution.toFixed(1)}</td>
+        </tr>`).join("")}
+      </tbody></table>
+      <p class="hint">Weighted scorecard <code>${esc(a.model_version)}</code>, run
+        ${esc(a.as_of)}. The same inputs always give the same answer, so this
+        assessment can be reconstructed later.</p>
+    </div>
+
+    <form id="decideForm" class="decide">
+      <div class="formgrid">
+        <div class="field"><label for="dcLimit">Limit you are granting</label>
+          <input id="dcLimit" inputmode="decimal" required
+                 value="${a.suggested_limit_paise ? String(a.suggested_limit_paise / 100) : "0"}"></div>
+        <div class="field wide"><label for="dcNote">Reason <span>optional</span></label>
+          <input id="dcNote" maxlength="500" placeholder="Start small, review in 90 days"></div>
+      </div>
+      <div class="err" id="dcErr"></div>
+      <div class="formactions">
+        <button type="submit" class="btn primary">Record this decision</button>
+      </div>
+      <p class="hint">Recorded against this assessment and written to the audit log.
+        It cannot be edited afterwards &#8212; run a new check instead.</p>
+    </form>
+  </div>`;
+}
+
+function wireCredit() {
+  document.querySelectorAll("[data-credit]").forEach(btn => btn.onclick = () => {
+    formOpen = true;
+    $("creditPanel").innerHTML = creditForm(btn.dataset.credit, btn.dataset.name);
+    $("creditPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    $("ccLimit").focus();
+    $("creditClose").onclick = () => { $("creditPanel").innerHTML = ""; formOpen = false; };
+
+    $("creditForm").onsubmit = async (e) => {
+      e.preventDefault();
+      const err = $("ccErr"); err.textContent = "";
+      const submit = $("creditForm").querySelector('button[type="submit"]');
+      submit.disabled = true;
+      try {
+        const gst = $("ccGst").value;
+        const a = await api(`/trade/buyers/${btn.dataset.credit}/credit-check`, {
+          method: "POST",
+          body: JSON.stringify({
+            requested_limit: $("ccLimit").value.trim(),
+            annual_turnover: $("ccTurnover").value.trim() || null,
+            years_trading: $("ccYears").value ? Number($("ccYears").value) : null,
+            other_creditor_exposure: $("ccOther").value.trim() || null,
+            trade_references: Number($("ccRefs").value || 0),
+            gst_registered: gst === "" ? null : gst === "yes",
+            turnover_verified: $("ccVerified").checked,
+            notes: $("ccNotes").value.trim() || null,
+          }),
+        });
+        $("creditResult").innerHTML = creditResult(a);
+        wireDecision(a);
+      } catch (ex) {
+        err.textContent = String(ex.message || ex);
+      } finally {
+        submit.disabled = false;
+      }
+    };
+  });
+}
+
+function wireDecision(assessment) {
+  const form = $("decideForm");
+  if (!form) return;
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const err = $("dcErr"); err.textContent = "";
+    const submit = form.querySelector('button[type="submit"]');
+    submit.disabled = true;
+    try {
+      const done = await api(`/trade/credit-check/${assessment.id}/decide`, {
+        method: "POST",
+        body: JSON.stringify({
+          approved_limit: $("dcLimit").value.trim(),
+          note: $("dcNote").value.trim() || null,
+        }),
+      });
+      form.outerHTML = `<div class="decided">Granted
+        <b>${esc(done.decided_limit_display)}</b> against a suggested
+        ${esc(done.suggested_limit_display)}. Recorded in the audit log.</div>`;
+    } catch (ex) {
+      err.textContent = String(ex.message || ex);
+      submit.disabled = false;
+    }
+  };
+}
+
+/* ------------------------------------------------------------------- forms
+   Both forms below are re-created by every repaint, so handlers are attached
+   here rather than once at startup. The live poll is paused while a form is
+   open: repainting under someone's hands would wipe what they had typed. */
+function wireForms() {
+  document.querySelectorAll("[data-toggle]").forEach(btn => btn.onclick = () => {
+    const form = $(btn.dataset.toggle);
+    if (!form) return;
+    form.hidden = !form.hidden;
+    formOpen = !form.hidden;
+    if (!form.hidden) form.querySelector("input")?.focus();
+  });
+
+  const addBuyer = $("addBuyer");
+  if (addBuyer) addBuyer.onsubmit = async (e) => {
+    e.preventDefault();
+    const err = $("nbErr"); err.textContent = "";
+    const submit = addBuyer.querySelector('button[type="submit"]');
+    submit.disabled = true;
+    try {
+      // Empty rows are dropped here so a blank second field is not sent as a
+      // number for the server to reject.
+      const phones = [$("nbPhone").value, $("nbPhone2").value]
+        .map(v => v.trim()).filter(Boolean);
+      await api("/trade/buyers", {
+        method: "POST",
+        body: JSON.stringify({
+          name: $("nbName").value.trim(),
+          phones,
+          language: $("nbLang").value,
+          email: $("nbEmail").value.trim() || null,
+          external_ref: $("nbRef").value.trim() || null,
+          // Sent as typed. The server parses Indian grouping in one place, so
+          // the browser never has to guess what 4,50,000 means.
+          amount: $("nbAmount").value.trim() || null,
+          due_date: $("nbDue").value || null,
+          invoice_number: $("nbInv").value.trim() || null,
+        }),
+      });
+      formOpen = false;
+      await load({ listOnly: true });
+      paint({ force: true });
+    } catch (ex) {
+      err.textContent = String(ex.message || ex);
+      submit.disabled = false;
+    }
+  };
+
+  const profileForm = $("profileForm");
+  if (profileForm) {
+    profileForm.oninput = () => { formOpen = true; };
+    profileForm.onsubmit = async (e) => {
+      e.preventDefault();
+      const err = $("pfErr"); err.textContent = "";
+      const submit = profileForm.querySelector('button[type="submit"]');
+      submit.disabled = true;
+      try {
+        cache.profile = await api("/portal/profile", {
+          method: "PUT",
+          body: JSON.stringify({
+            legal_name: $("pfName").value.trim(),
+            gstin: $("pfGstin").value.trim() || null,
+            cin: $("pfCin").value.trim() || null,
+            state_code: $("pfState").value.trim() || null,
+            registered_address: $("pfAddr").value.trim() || null,
+          }),
+        });
+        formOpen = false;
+        paint({ force: true });
+        const saved = $("pfErr");
+        if (saved) { saved.textContent = "Saved."; saved.style.color = "var(--green-700)"; }
+      } catch (ex) {
+        err.textContent = String(ex.message || ex);
+        submit.disabled = false;
+      }
+    };
+  }
+}
+
+/* ------------------------------------------------------------------- loading
+   One request for the whole console state, plus one more only for the list the
+   open view actually shows. The previous shape was 6 + N requests every fifteen
+   seconds — a separate progress call per campaign — each re-opening a session
+   and re-running its own aggregates, per open tab, per tenant.
+
+   `/portal/state` carries an ETag, so a poll that finds nothing changed is a
+   304 with no body and no aggregate queries. Between scheduler ticks that is
+   the common case. */
+const LIST_FOR = { calls: "calls", messages: "messages", ledger: "accounts", buyers: "buyers" };
+let stateEtag = null;
+
+async function fetchState() {
+  const res = await fetch("/api/portal/state", {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(stateEtag ? { "If-None-Match": stateEtag } : {}),
+    },
+  });
+  if (res.status === 401) { signOut(); throw new Error("Session expired"); }
+  if (res.status === 304) return null;          // unchanged; keep what we have
+  if (!res.ok) throw new Error(await res.text());
+  stateEtag = res.headers.get("ETag");
+  return res.json();
+}
+
+async function load({ listOnly = false } = {}) {
+  const kind = LIST_FOR[current];
+  const [state, rows] = await Promise.all([
+    listOnly ? Promise.resolve(null) : fetchState().catch(() => null),
+    // Only the open view's rows. The Overview shows none of them, so on that
+    // view this is skipped entirely.
+    kind ? api(`/portal/list/${kind}?limit=50`).catch(() => []) : Promise.resolve(null),
+  ]);
+
+  if (state) {
+    cache.company = state.company;
+    cache.user = state.user;
+    cache.summary = state.summary;
+    cache.campaigns = state.campaigns;
+    cache.progress = state.campaigns.map(c => c.progress || {});
+    cache.reports = state.reports;
+    const el = $("companyName");
+    if (el) el.textContent = state.company.name;
+  }
+  if (kind && rows) cache[kind] = rows;
+
+  // The profile is its own endpoint rather than part of portal state: it is
+  // read on one screen and changes about once a year, so it has no business
+  // being in a payload that polls every fifteen seconds.
+  if (current === "profile") {
+    cache.profile = await api("/portal/profile").catch(() => cache.profile || null);
+  }
+
+  lastLoaded = Date.now();
+  paint();
+  tickClock();
+}
+
+/* ------------------------------------------------------------ live refresh
+   Polling, not websockets: the numbers move at campaign speed (a tick every
+   ten seconds), so a socket would be machinery for a problem that does not
+   exist. Refresh pauses while the tab is hidden — a background tab polling a
+   dashboard nobody is looking at is just load. */
+/* Charts are sized in JS, so a rotation or a resized window has to rebuild
+   them — CSS alone cannot re-lay-out an SVG whose geometry is baked in.
+   Debounced, because a drag fires this continuously. */
+let resizeTimer = null, lastChartW = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    const w = chartMetrics().width;
+    if (w === lastChartW) return;   // same geometry, nothing to redraw
+    lastChartW = w;
+    if (document.getElementById("console").classList.contains("hidden")) return;
+    // fitCharts, not paint({force:true}). A forced repaint rebuilds the whole
+    // view and takes any open form down with it — including whatever the
+    // operator had typed. Rotating a phone should not discard a half-filled
+    // credit check. fitCharts rebuilds each chart from its own stored spec and
+    // leaves the rest of the DOM alone.
+    fitCharts();
+  }, 150);
+});
+
+const REFRESH_MS = 15000;
+let lastLoaded = 0, autoRefresh = true, refreshTimer = null, clockTimer = null;
+
+function tickClock() {
+  const el = $("liveLabel");
+  if (!el) return;
+  const secs = Math.round((Date.now() - lastLoaded) / 1000);
+  el.textContent = !autoRefresh ? "Paused"
+    : secs < 5 ? "Live" : `Updated ${secs}s ago`;
+}
+
+function scheduleRefresh() {
+  clearInterval(refreshTimer); clearInterval(clockTimer);
+  clockTimer = setInterval(tickClock, 1000);
+  refreshTimer = setInterval(() => {
+    if (!autoRefresh || document.hidden || !token) return;
+    load().catch(() => {});
+  }, REFRESH_MS);
+}
+
+document.addEventListener("visibilitychange", () => {
+  // Catch up immediately on return rather than waiting out the interval.
+  if (!document.hidden && autoRefresh && token) load().catch(() => {});
+});
+
+function signOut() {
+  token = null; localStorage.removeItem("crp_token");
+  $("console").classList.add("hidden"); $("login").classList.remove("hidden");
+}
+
+/* Sign-in goes to whichever identity provider the server is configured for.
+   In `supabase` mode the password never touches this backend: the browser
+   authenticates against Supabase directly and we only ever see the resulting
+   access token, which the API verifies by signature. */
+let authConfig = { backend: "local", supabase: null };
+
+async function signInSupabase(email, password) {
+  const { url, anon_key } = authConfig.supabase || {};
+  if (!url || !anon_key) throw new Error("Supabase auth is not configured");
+  const res = await fetch(`${url}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: anon_key },
+    body: JSON.stringify({ email, password }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error_description || body.msg || "Invalid credentials");
+  return body.access_token;
+}
+
+async function signInLocal(email, password) {
+  const res = await fetch("/api/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) throw new Error("Invalid credentials");
+  return (await res.json()).access_token;
+}
+
+let authMode = "signin";   // signin | signup
+
+function setAuthMode(mode) {
+  authMode = mode;
+  const signup = mode === "signup";
+  $("authTitle").textContent = signup ? "Create your account" : "Sign in";
+  $("authLede").textContent = signup
+    ? "Sets up a new company. You will be its owner."
+    : "Operate campaigns, review refusals and approve legal content.";
+  $("signin").textContent = signup ? "Create account" : "Sign in";
+  $("companyField").classList.toggle("hidden", !signup);
+  $("switchText").textContent = signup ? "Already have an account?" : "No account yet?";
+  $("switchMode").textContent = signup ? "Sign in" : "Create one";
+  $("password").setAttribute("autocomplete", signup ? "new-password" : "current-password");
+  $("loginError").textContent = "";
+}
+
+$("switchMode").onclick = (e) => {
+  e.preventDefault();
+  setAuthMode(authMode === "signin" ? "signup" : "signin");
+};
+
+async function supabaseSignUp(email, password) {
+  const { url, anon_key } = authConfig.supabase || {};
+  const res = await fetch(`${url}/auth/v1/signup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: anon_key },
+    body: JSON.stringify({ email, password }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error_description || body.msg || "Could not sign up");
+  // With email confirmation on, Supabase returns a user but no session — there
+  // is nothing to register with until they click the link, and saying so beats
+  // a silent no-op.
+  if (!body.access_token) {
+    throw new Error("Check your email to confirm the address, then sign in.");
+  }
+  return body.access_token;
+}
+
+/* Registration runs against OUR API with the verified token. It creates a new
+   company — it never joins an existing one — unless an admin has already put
+   this email in, in which case the invitation is accepted. */
+async function registerWithBackend(accessToken, companyName) {
+  const res = await fetch("/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+    body: JSON.stringify({ company_name: companyName || "" }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail || "Could not create the account");
+  return body;
+}
+
+$("google").onclick = () => {
+  const { url } = authConfig.supabase || {};
+  if (!url) return;
+  // Supabase handles the whole OAuth dance and redirects back with the token in
+  // the URL fragment, which `consumeOAuthFragment` picks up on load.
+  const redirect = encodeURIComponent(window.location.origin + "/");
+  window.location.href =
+    `${url}/auth/v1/authorize?provider=google&redirect_to=${redirect}`;
+};
+
+/* After an OAuth round trip Supabase appends the session to the fragment.
+   Read it, clear it from the address bar so the token is not left in history,
+   then register-or-link before booting. */
+async function consumeOAuthFragment() {
+  if (!location.hash.includes("access_token=")) return false;
+  const params = new URLSearchParams(location.hash.slice(1));
+  const accessToken = params.get("access_token");
+  history.replaceState(null, "", location.pathname);
+  if (!accessToken) return false;
+  token = accessToken;
+  localStorage.setItem("crp_token", token);
+  try {
+    await registerWithBackend(accessToken, "");
+  } catch {
+    /* Already registered, or needs an invitation — boot() surfaces which. */
+  }
+  return true;
+}
+
+$("signin").onclick = async () => {
+  $("loginError").textContent = "";
+  const btn = $("signin");
+  btn.disabled = true;
+  try {
+    const email = $("email").value.trim();
+    const password = $("password").value;
+    const company = $("company") ? $("company").value.trim() : "";
+
+    if (authMode === "signup") {
+      if (authConfig.backend !== "supabase") {
+        throw new Error("Account creation needs Supabase; this server is on local auth.");
+      }
+      if (!company) throw new Error("Enter a company name.");
+      token = await supabaseSignUp(email, password);
+      const result = await registerWithBackend(token, company);
+      localStorage.setItem("crp_token", token);
+      if (result.status === "joined_by_invitation") {
+        $("loginError").textContent = "";
+      }
+    } else {
+      token = authConfig.backend === "supabase"
+        ? await signInSupabase(email, password)
+        : await signInLocal(email, password);
+      localStorage.setItem("crp_token", token);
+    }
+    await boot();
+  } catch (e) {
+    $("loginError").textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+$("password").onkeydown = (e) => { if (e.key === "Enter") $("signin").click(); };
+$("logout").onclick = signOut;
+$("refresh").onclick = () => load();
+$("liveToggle").onclick = () => {
+  autoRefresh = !autoRefresh;
+  $("liveToggle").className = `live ${autoRefresh ? "on" : "paused"}`;
+  $("liveToggle").title = autoRefresh ? "Pause automatic refresh" : "Resume automatic refresh";
+  if (autoRefresh) load().catch(() => {});
+  tickClock();
+};
+
+async function boot() {
+  const health = await (await fetch("/health")).json();
+  const envText = `${health.env} · tts:${health.backends.tts} · telephony:${health.backends.telephony}`;
+  $("env").textContent = envText + (health.allowlist_enforced ? " · allowlist enforced" : "");
+  $("envfoot").textContent = envText;
+  try {
+    const me = await api("/auth/me");
+    $("whoami").textContent = (me.roles || []).join(", ") || "signed in";
+    $("login").classList.add("hidden");
+    $("console").classList.remove("hidden");
+    renderNav();
+    await load();
+    scheduleRefresh();
+  } catch { signOut(); }
+}
+
+async function init() {
+  try {
+    authConfig = await (await fetch("/api/auth/config")).json();
+  } catch { /* keep the local default */ }
+  if (authConfig.backend === "supabase") {
+    $("google").classList.remove("hidden");
+    $("divider").classList.remove("hidden");
+  }
+  setAuthMode("signin");
+  const cameFromOAuth = await consumeOAuthFragment();
+  if (token || cameFromOAuth) boot().catch(signOut);
+}
+init();
+</script>
+</body>
+</html>

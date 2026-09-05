@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: crp-postgres
+    environment:
+      POSTGRES_USER: crp
+      POSTGRES_PASSWORD: crp
+      POSTGRES_DB: crp
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crp -d crp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: crp-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # The API and the scheduler are the same image and the same code. They are
+  # separate processes because they scale differently and because a deploy of one
+  # should not sever the other mid-dispatch.
+  api:
+    profiles: ["app"]
+    build: ./backend
+    container_name: crp-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql+psycopg://crp_app:crp_app@postgres:5432/crp
+      DATABASE_URL_WORKER: postgresql+psycopg://crp_worker:crp_worker@postgres:5432/crp
+      DATABASE_URL_ADMIN: postgresql+psycopg://crp:crp@postgres:5432/crp
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - audio:/app/var/audio
+      - sounds:/var/lib/asterisk/sounds/crp
+
+  scheduler:
+    profiles: ["app"]
+    build: ./backend
+    container_name: crp-scheduler
+    command: python -m app.worker
+    environment:
+      DATABASE_URL: postgresql+psycopg://crp_app:crp_app@postgres:5432/crp
+      DATABASE_URL_WORKER: postgresql+psycopg://crp_worker:crp_worker@postgres:5432/crp
+      DATABASE_URL_ADMIN: postgresql+psycopg://crp:crp@postgres:5432/crp
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - audio:/app/var/audio
+      - sounds:/var/lib/asterisk/sounds/crp
+
+  # Telephony stays behind a profile: the rest of the system is fully testable
+  # without it, and everything except PSTN termination works with the stub.
+  #   docker compose --profile telephony up -d
+  asterisk:
+    profiles: ["telephony"]
+    build: ./asterisk
+    container_name: crp-asterisk
+    # host networking so RTP does not traverse a NAT that would produce
+    # one-way audio for reasons unrelated to the application.
+    network_mode: host
+    volumes:
+      - ./asterisk/conf:/etc/asterisk:ro
+      - sounds:/var/lib/asterisk/sounds/crp
+
+volumes:
+  pgdata:
+  audio:
+  sounds:

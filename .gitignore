@@ -1,0 +1,21 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Generated audio assets — reproducible from the message hash, never committed.
+var/
+*.sln
+*.wav
+*.mp3
+
+# Asterisk runtime
+asterisk/conf/*.local.conf
+
+.DS_Store
+.idea/
+.vscode/
