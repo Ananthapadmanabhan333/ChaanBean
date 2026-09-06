@@ -4,6 +4,15 @@ uvicorn[standard]==0.34.0
 pydantic==2.10.4
 pydantic-settings==2.7.1
 
+# Pinned because they are load-bearing transitives, not because we import them.
+# fastapi's range allows a starlette whose own import reaches
+# `anyio.abc.BlockingPortal`, an alias recent anyio deprecates — and pytest.ini
+# turns DeprecationWarning into an error, so an unpinned resolve does not fail a
+# test, it fails COLLECTION of every module that imports TestClient. A clean
+# `pip install -r requirements.txt` on a new machine reproduced exactly that.
+starlette==0.41.3
+anyio==4.7.0
+
 # Data
 SQLAlchemy==2.0.36
 psycopg[binary]==3.2.3
