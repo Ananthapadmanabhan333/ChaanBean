@@ -61,6 +61,21 @@ class Buyer(Base, TimestampMixin):
     language: Mapped[str] = mapped_column(String(10), default="en-IN", nullable=False)
     email: Mapped[str | None] = mapped_column(String(255))
 
+    # DECLARED identifiers — what the creditor typed off an invoice. Read this
+    # row as "the creditor says", because the next person here will assume
+    # otherwise: nobody has checked that this GSTIN exists, that it belongs to
+    # this buyer, or that its fifteen characters are even self-consistent. A
+    # single mistyped character usually still yields a valid GSTIN, one that
+    # belongs to a different real business.
+    #
+    # Verification is what turns a declaration into evidence, and it writes its
+    # result to company_profiles and verification_reports — never back into these
+    # two columns. Anything that publishes, dials or serves notice must read the
+    # verified side; app.company.identifiers can tell you whether what is here is
+    # even well-formed.
+    gstin: Mapped[str | None] = mapped_column(String(15))
+    cin: Mapped[str | None] = mapped_column(String(21))
+
     # Consent is a property of the person, not of a number.
     consent_withdrawn: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     consent_withdrawn_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

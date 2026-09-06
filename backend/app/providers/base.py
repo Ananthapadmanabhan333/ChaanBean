@@ -13,6 +13,7 @@ four copies of a safety check is three chances to forget one.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Protocol, runtime_checkable
 
 from app.config import settings
@@ -128,3 +129,93 @@ class TelephonyBackend(Protocol):
     ) -> OriginateResult: ...
 
     def hangup(self, channel_id: str) -> None: ...
+
+
+# ----------------------------------------------------- company registries
+
+# Where a fact came from. Two answers, and no third one.
+#
+#   REGISTRY       a backend fetched it from the source of record.
+#   USER_PROVIDED  a human opened the portal, read the screen, and typed it in.
+#
+# This field is not bookkeeping. Self-declared data wearing a verification label
+# is how a dunning call, a legal notice or a public registry listing ends up
+# aimed at a company that has nothing to do with the debt. So: only REGISTRY data
+# may support `app.company.resolution.Tier.IDENTIFIER`, and only that tier is
+# publishable. Everything downstream leans on this one string being honest.
+REGISTRY = "REGISTRY"
+USER_PROVIDED = "USER_PROVIDED"
+PROVENANCES = (REGISTRY, USER_PROVIDED)
+
+
+class UnknownProvenance(ValueError):
+    """A lookup declared a provenance outside the closed set."""
+
+
+def is_registry_provenance(provenance: str | None) -> bool:
+    """True for the exact REGISTRY literal and nothing else.
+
+    Written as a positive test on purpose. The tempting form is
+    `provenance != USER_PROVIDED`, which reads a typo, a None or an invented
+    third value as evidence — the answer to "is this verified" has to fail
+    towards no.
+    """
+    return provenance == REGISTRY
+
+
+def _assert_provenance(value: str, what: str) -> None:
+    if value not in PROVENANCES:
+        raise UnknownProvenance(
+            f"{what}.provenance must be one of {PROVENANCES}; got {value!r}. "
+            f"A source that cannot say where its data came from does not get to "
+            f"claim it came from the registry."
+        )
+
+
+@dataclass(frozen=True)
+class GstLookup:
+    """One GSTIN as some source describes it."""
+
+    gstin: str
+    legal_name: str | None
+    trade_name: str | None
+    status: str | None  # "Active" | "Cancelled" | "Suspended"
+    registration_date: date | None
+    address: str | None
+    state_code: str | None
+    filing_history: list[dict]
+    provenance: str  # REGISTRY | USER_PROVIDED
+
+    def __post_init__(self) -> None:
+        _assert_provenance(self.provenance, "GstLookup")
+
+
+@runtime_checkable
+class GstBackend(Protocol):
+    name: str
+
+    def lookup(self, gstin: str) -> GstLookup | None: ...
+
+
+@dataclass(frozen=True)
+class McaLookup:
+    """One CIN as some source describes it."""
+
+    cin: str
+    legal_name: str | None
+    status: str | None  # "Active" | "Struck Off" | "Under Liquidation"
+    incorporation_date: date | None
+    registered_address: str | None
+    directors: list[dict]
+    charges: list[dict]
+    provenance: str  # REGISTRY | USER_PROVIDED
+
+    def __post_init__(self) -> None:
+        _assert_provenance(self.provenance, "McaLookup")
+
+
+@runtime_checkable
+class McaBackend(Protocol):
+    name: str
+
+    def lookup(self, cin: str) -> McaLookup | None: ...

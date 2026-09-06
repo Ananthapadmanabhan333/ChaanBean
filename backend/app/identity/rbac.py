@@ -37,12 +37,21 @@ class Permission(str, enum.Enum):
     CAMPAIGN_WRITE = "campaign:write"
     CAMPAIGN_START = "campaign:start"
     TEMPLATE_WRITE = "template:write"
+    # Running a registry lookup is ordinary desk work: it reads a portal, records
+    # what came back, and publishes nothing on its own.
+    COMPANY_VERIFY = "company:verify"
 
     # privileged
     TEMPLATE_APPROVE_L3 = "template:approve_l3"
     USER_MANAGE = "user:manage"
     APIKEY_MANAGE = "apikey:manage"
     COMPANY_SETTINGS = "company:settings"
+    # Confirming a weak match is the act that attaches a named company's registry
+    # record to a debt — after which that company can be dunned, listed, or sent
+    # a notice. It follows the TEMPLATE_APPROVE_L3 precedent of deliberately not
+    # being an operator power: whoever is chasing the money should not also be
+    # deciding, on a name resemblance, whose money it is.
+    ENTITY_CONFIRM = "entity:confirm"
 
 
 _READ_ONLY = frozenset(
@@ -61,6 +70,7 @@ _OPERATOR = _READ_ONLY | {
     Permission.CAMPAIGN_WRITE,
     Permission.CAMPAIGN_START,
     Permission.TEMPLATE_WRITE,
+    Permission.COMPANY_VERIFY,
 }
 
 _ADMIN = _OPERATOR | {
@@ -68,10 +78,13 @@ _ADMIN = _OPERATOR | {
     Permission.APIKEY_MANAGE,
     Permission.COMPANY_SETTINGS,
     Permission.AUDIT_READ,
+    Permission.ENTITY_CONFIRM,
 }
 
 # Note what is absent from every role below: TEMPLATE_APPROVE_L3 belongs only to
-# legal_approver, including for the owner.
+# legal_approver, including for the owner. ENTITY_CONFIRM stops at admin for the
+# same kind of reason — an operator may run a verification all day and still not
+# be the one who decides a borderline match names a real company.
 ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
     Role.VIEWER: frozenset(_READ_ONLY),
     Role.OPERATOR: frozenset(_OPERATOR),

@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     sms_backend: Literal["fake", "gupshup"] = "fake"
     whatsapp_backend: Literal["fake", "meta"] = "fake"
     email_backend: Literal["fake", "ses"] = "fake"
+    # Company registries. Unlike the backends above, this pair changes what the
+    # system may *claim*, not just who does the work. `local` reports REGISTRY
+    # provenance and can therefore support an identifier-tier match; `manual` —
+    # a human read a government portal and typed what they saw — reports
+    # USER_PROVIDED and can never reach that tier or be published.
+    gst_backend: Literal["local", "manual"] = "local"
+    mca_backend: Literal["local", "manual"] = "local"
 
     # --- contact safety (rule 4) ------------------------------------------
     # Outside production, refuse to contact anyone not on this list. Twenty lines
@@ -111,6 +118,12 @@ class Settings(BaseSettings):
     jwt_secret: str = Field(default="dev-only-change-me")
     jwt_ttl_minutes: int = 720
     refresh_ttl_days: int = 30
+    # Keys the PAN digest in app.company.resolution.hash_pan. A PAN is a national
+    # identifier, and the profile row keeps its last four characters beside the
+    # hash — so an unkeyed digest leaves about 10^8 guesses between a database
+    # dump and the number itself. Kept separate from `jwt_secret` because
+    # rotating a signing key must not silently invalidate stored identifiers.
+    pan_pepper: str = Field(default="dev-only-change-me")
     otp_ttl_seconds: int = 300
     otp_max_per_hour: int = 5
 

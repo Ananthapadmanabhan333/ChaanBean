@@ -25,6 +25,8 @@ from sqlalchemy.orm import Session
 
 from app.api.schemas import (
     AccountOut,
+    BuyerIdentityIn,
+    BuyerIdentityOut,
     BuyerIn,
     BuyerOut,
     CallerIdOut,
@@ -33,6 +35,7 @@ from app.api.schemas import (
     CreditDecisionIn,
     CompanyProfileIn,
     CompanyProfileOut,
+    EntityCandidateReviewIn,
     PhoneIn,
     CallOut,
     CampaignIn,
@@ -44,7 +47,11 @@ from app.api.schemas import (
     PaymentIn,
     TemplateIn,
     TokenResponse,
+    VerificationOut,
 )
+from app.company import build_gst_backend, build_mca_backend
+from app.company.identifiers import validate_cin, validate_gstin
+from app.company.resolution import PAN_RE, Tier, hash_pan, state_from_gstin
 from app.identity import audit
 from app.identity.auth import (
     Principal,
@@ -73,8 +80,10 @@ from app.models import (
     Campaign,
     CampaignStatus,
     CreditAccount,
+    EntityCandidate,
     EscalationLevel,
     EscalationState,
+    GstRecord,
     ImportBatch,
     Invoice,
     InvoiceStatus,
@@ -84,7 +93,9 @@ from app.models import (
     PaymentBehaviour,
     TemplateVersion,
     User,
+    VerificationReport,
 )
+from app.providers.base import REGISTRY
 from app.render.numbers import format_inr
 from app.scheduler import campaign as campaign_ops
 from app.trade import accounts as account_ops
@@ -643,6 +654,377 @@ def add_buyer_phone(
     return buyer
 
 
+# ------------------------------------------- buyer identity and verification
+#
+# Who this debtor is in the registries' terms rather than in the operator's.
+# Everything downstream that names a company outside this building — a demand
+# call, a legal notice, a registry listing — keys off what these four routes
+# establish, which is why a typed-in identifier is stored but never counts as
+# verified, and why a borderline match waits for a person instead of merging.
+
+
+def _buyer_profile(session: Session, buyer_id: UUID) -> CompanyProfile | None:
+    """The resolved-entity row for one buyer.
+
+    `CompanyProfile` doubles as the tenant's own profile — that is the row with
+    *no* buyer attached, which is why `_profile_row` filters the mirror image of
+    this. Without the filter each would happily return the other's row.
+    """
+    return session.execute(
+        select(CompanyProfile)
+        .where(CompanyProfile.buyer_id == buyer_id)
+        .order_by(CompanyProfile.created_at.desc())
+    ).scalars().first()
+
+
+def _clean_gstin(raw: str | None, *, state_code: str | None) -> str | None:
+    """Check a GSTIN, or refuse the request saying which check failed.
+
+    The refusal carries `check.detail` verbatim. It is written for a person who
+    has just mistyped something and has to find the character, and rephrasing it
+    here would produce a second, vaguer version of the same sentence.
+    """
+    if not raw or not raw.strip():
+        return None
+    check = validate_gstin(raw)
+    if not check.ok:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{check.value!r} is not a usable GSTIN: {check.detail}",
+        )
+    if state_code and check.value[:2] != state_code:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"state code {state_code!r} contradicts the GSTIN, which is "
+            f"registered in state {check.value[:2]!r} — one of the two is wrong, "
+            f"and guessing which would be guessing at a company's identity",
+        )
+    return check.value
+
+
+def _clean_cin(raw: str | None) -> str | None:
+    """Structure only — a CIN carries no check digit to verify it against."""
+    if not raw or not raw.strip():
+        return None
+    check = validate_cin(raw)
+    if not check.ok:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{check.value!r} is not a usable CIN: {check.detail}",
+        )
+    return check.value
+
+
+def _identity_out(buyer: Buyer, profile: CompanyProfile | None) -> BuyerIdentityOut:
+    return BuyerIdentityOut(
+        buyer_id=buyer.id,
+        name=(profile.legal_name if profile and profile.legal_name else buyer.name),
+        gstin=profile.gstin if profile else None,
+        cin=profile.cin if profile else None,
+        pan_last4=profile.pan_last4 if profile else None,
+        registered_address=profile.registered_address if profile else None,
+        state_code=profile.state_code if profile else None,
+    )
+
+
+@trade_router.put("/buyers/{buyer_id}/identity", response_model=BuyerIdentityOut)
+def set_buyer_identity(
+    buyer_id: UUID,
+    body: BuyerIdentityIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+):
+    """Record what we have been *told* this buyer is.
+
+    A full replacement of the declared identity, and never a promotion. Editing
+    it voids whatever tier a previous verification reached: the row goes back to
+    `self_declared` and has to be verified again. That is heavier than tracking
+    which particular field moved, and it is the right weight — the alternative
+    is a profile still labelled IDENTIFIER while carrying a name, an address or
+    a number that a person typed after the registry was last consulted, and it
+    is the label that a notice or a listing is issued against.
+    """
+    buyer = session.get(Buyer, buyer_id)
+    if buyer is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such buyer")
+
+    state_code = (body.state_code or "").strip().upper() or None
+    gstin = _clean_gstin(body.gstin, state_code=state_code)
+    cin = _clean_cin(body.cin)
+    state_code = state_code or state_from_gstin(gstin)
+
+    pan_hash = pan_last4 = None
+    if body.pan and body.pan.strip():
+        pan = body.pan.strip().upper()
+        if not PAN_RE.match(pan):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "that is not shaped like a PAN — five letters, four digits, "
+                "one letter",
+            )
+        # Hashed in this frame and dropped. Nothing downstream holds the number.
+        pan_hash, pan_last4 = hash_pan(pan)
+
+    row = _buyer_profile(session, buyer_id)
+    if row is None:
+        row = CompanyProfile(
+            company_id=principal.company_id,
+            buyer_id=buyer_id,
+            legal_name=(body.legal_name or "").strip() or buyer.name,
+        )
+        session.add(row)
+
+    if body.legal_name and body.legal_name.strip():
+        row.legal_name = body.legal_name.strip()
+    row.gstin = gstin
+    row.cin = cin
+    # The buyer row carries whatever an import or an invoice put there, and
+    # verification refuses to run at all while the two declarations name
+    # different companies. This endpoint is the only place a person answers that
+    # question, and the answer has to land on both rows or the refusal has no
+    # exit: nothing else in the HTTP surface can write these two columns.
+    buyer.gstin = gstin
+    buyer.cin = cin
+    row.pan_hash = pan_hash
+    row.pan_last4 = pan_last4
+    row.registered_address = (body.registered_address or "").strip() or None
+    row.state_code = state_code
+    # Registry findings, cleared along with the tier that vouched for them.
+    row.status = None
+    row.resolution_tier = "self_declared"
+    row.confidence = 0
+    row.resolved_at = None
+    session.flush()
+
+    audit.record_for(
+        session,
+        principal,
+        action="company.identity.declared",
+        entity_type="buyer",
+        entity_id=buyer_id,
+        after={
+            "legal_name": row.legal_name,
+            "gstin": row.gstin,
+            "cin": row.cin,
+            # The last four only, for the same reason the column holds only that.
+            "pan_last4": row.pan_last4,
+            "state_code": row.state_code,
+            "resolution_tier": row.resolution_tier,
+        },
+    )
+    session.commit()
+    session.refresh(row)
+    return _identity_out(buyer, row)
+
+
+@trade_router.post(
+    "/buyers/{buyer_id}/verify", response_model=VerificationOut, status_code=201
+)
+def verify_buyer_identity(
+    buyer_id: UUID,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.COMPANY_VERIFY)),
+):
+    """Run the registries against what we hold, and record the answer.
+
+    201 because every run writes a new record rather than replacing the last
+    one. "What did we know in March" has to stay answerable, and a verification
+    that overwrote its predecessor would make March unanswerable the moment
+    somebody clicked the button again.
+    """
+    from app.company.verification import verify_buyer
+
+    buyer = session.get(Buyer, buyer_id)
+    if buyer is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such buyer")
+
+    gst, mca = build_gst_backend(), build_mca_backend()
+    now = datetime.now(timezone.utc)
+
+    # Two audit rows for one click, and deliberately not the same row twice:
+    # this one says who asked and which adapters were configured when they did,
+    # and `verify_buyer` writes what came back. A run that found nothing and a
+    # run against a manual backend look identical in the outcome; here they do
+    # not.
+    audit.record_for(
+        session,
+        principal,
+        action="company.verification.requested",
+        entity_type="buyer",
+        entity_id=buyer_id,
+        after={
+            "gst_backend": getattr(gst, "name", None),
+            "mca_backend": getattr(mca, "name", None),
+        },
+    )
+
+    outcome = verify_buyer(
+        session,
+        buyer_id,
+        company_id=principal.company_id,
+        actor_label=principal.label or str(principal.user_id),
+        gst=gst,
+        mca=mca,
+        now=now,
+        issued_by=principal.user_id,
+    )
+    session.commit()
+
+    return VerificationOut(
+        buyer_id=buyer_id,
+        buyer_name=buyer.name,
+        tier=outcome.tier,
+        confidence=outcome.confidence,
+        publishable=outcome.publishable,
+        gst_status=outcome.gst_status,
+        mca_status=outcome.mca_status,
+        signals=list(outcome.signals),
+        blockers=list(outcome.blockers),
+        candidate_id=outcome.candidate_id,
+        verified_at=now,
+    )
+
+
+@trade_router.get("/buyers/{buyer_id}/verification", response_model=VerificationOut)
+def get_buyer_verification(
+    buyer_id: UUID,
+    session: Session = Depends(tenant_db),
+    _: Principal = Depends(require(Permission.BUYER_READ)),
+):
+    """The most recent verification. 404 when nobody has ever run one.
+
+    404 rather than an empty body with `publishable: false`: "never checked" and
+    "checked and failed" are different facts, and a caller that cannot tell them
+    apart will eventually treat the first as the second.
+    """
+    buyer = session.get(Buyer, buyer_id)
+    if buyer is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such buyer")
+
+    row = session.execute(
+        select(VerificationReport)
+        .join(CompanyProfile, CompanyProfile.id == VerificationReport.profile_id)
+        .where(CompanyProfile.buyer_id == buyer_id)
+        .order_by(VerificationReport.issued_at.desc())
+        .limit(1)
+    ).scalars().first()
+    if row is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "this buyer has never been verified"
+        )
+
+    payload = row.payload or {}
+    return VerificationOut(
+        buyer_id=buyer_id,
+        buyer_name=buyer.name,
+        tier=payload.get("tier") or "NONE",
+        confidence=float(payload.get("confidence", row.confidence or 0)),
+        publishable=bool(payload.get("publishable", False)),
+        gst_status=payload.get("gst_status"),
+        mca_status=payload.get("mca_status"),
+        signals=payload.get("signals") or [],
+        blockers=payload.get("blockers") or [],
+        candidate_id=payload.get("candidate_id"),
+        verified_at=row.issued_at,
+    )
+
+
+@trade_router.post("/entity-candidates/{candidate_id}/review")
+def review_entity_candidate(
+    candidate_id: UUID,
+    body: EntityCandidateReviewIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.ENTITY_CONFIRM)),
+):
+    """Confirm or reject a proposed match. Once, and then never again.
+
+    Note what confirming does *not* do: it does not raise the tier. A candidate
+    exists precisely because the evidence fell short of an identifier match, and
+    a person agreeing with a name resemblance does not turn it into one. The
+    profile records the tier the evidence actually reached, so the publication
+    gate and the credit-scoring gate both still see a resemblance for what it
+    is; what the confirmation buys is a usable profile and a named reviewer.
+    """
+    # The named reviewer is half of what this route produces, and `reviewed_by`
+    # takes a user. An API key scoped `entity:confirm` clears the permission
+    # check carrying no user id, and would file the decision as nobody's —
+    # which is the one thing a separation-of-duties gate cannot record.
+    if principal.user_id is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "deciding whose company this is needs a named user; an API key "
+            "cannot be the person who signed off on it",
+        )
+
+    candidate = session.get(EntityCandidate, candidate_id)
+    if candidate is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "no such entity candidate"
+        )
+    if candidate.status != "PROPOSED":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"this candidate was already {candidate.status.lower()}; run a new "
+            f"verification rather than overwriting the record of who decided "
+            f"what, and when",
+        )
+
+    now = datetime.now(timezone.utc)
+    decision = "CONFIRMED" if body.decision == "CONFIRM" else "REJECTED"
+    profile_id = None
+
+    if decision == "CONFIRMED":
+        row = _buyer_profile(session, candidate.buyer_id)
+        if row is None:
+            row = CompanyProfile(
+                company_id=principal.company_id,
+                buyer_id=candidate.buyer_id,
+                legal_name=candidate.candidate_name,
+            )
+            session.add(row)
+        if row.resolution_tier != Tier.IDENTIFIER.value:
+            # Never downgrade a profile that already matched on an identifier.
+            # A weaker candidate arriving afterwards is new evidence about the
+            # same buyer, not a reason to forget the decisive evidence — and the
+            # identifier is the decisive part, so it is inside this guard too.
+            # Left outside it, confirming a stale candidate would swap the GSTIN
+            # on a row still stamped IDENTIFIER, and every downstream reader
+            # (`_registry_signals`, `_gst_filing_regular`) trusts that stamp.
+            row.legal_name = candidate.candidate_name
+            row.resolution_tier = candidate.tier
+            row.confidence = candidate.score
+            row.resolved_at = now
+            if candidate.identifier_kind == "gstin" and candidate.identifier_value:
+                row.gstin = candidate.identifier_value
+                row.state_code = state_from_gstin(row.gstin) or row.state_code
+            elif candidate.identifier_kind == "cin" and candidate.identifier_value:
+                row.cin = candidate.identifier_value
+        session.flush()
+        profile_id = row.id
+
+    candidate.status = decision
+    candidate.reviewed_by = principal.user_id
+    candidate.reviewed_at = now
+
+    audit.record_for(
+        session,
+        principal,
+        action="company.candidate.reviewed",
+        entity_type="entity_candidate",
+        entity_id=candidate_id,
+        after={
+            "decision": decision,
+            "buyer_id": str(candidate.buyer_id),
+            "candidate_name": candidate.candidate_name,
+            "tier": candidate.tier,
+            "profile_id": str(profile_id) if profile_id else None,
+            "note": body.note,
+        },
+    )
+    session.commit()
+    return {"status": decision}
+
+
 # ------------------------------------------------------- credit eligibility
 #
 # Recommendation only. Nothing here approves or declines a limit: the score, the
@@ -715,6 +1097,61 @@ def _ledger_facts(session: Session, buyer_id: UUID, now: datetime):
     )
 
 
+def _gst_filing_regular(session: Session, profile: CompanyProfile) -> bool | None:
+    """Whether GST returns are being filed, or None when we cannot say.
+
+    Read from the registration status rather than from the filing list. A GSTIN
+    cancelled suo motu is cancelled *for* non-filing, which makes the status the
+    more reliable of the two — and the only one whose shape is fixed by the
+    adapter contract rather than by whatever a portal happened to return.
+
+    Only registry-fetched records are considered, which is the provenance rule
+    reaching this far down: a status a person read off a website and typed in is
+    a claim, and a claim must not become a scored fact about somebody's
+    creditworthiness. The filter is in the query rather than on the row that
+    comes back, so an operator-entered record landing after a real fetch does
+    not erase what the fetch found.
+    """
+    if not profile.gstin:
+        return None
+    record = session.execute(
+        select(GstRecord)
+        .where(
+            GstRecord.gstin == profile.gstin,
+            GstRecord.provenance == REGISTRY,
+        )
+        .order_by(GstRecord.fetched_at.desc())
+        .limit(1)
+    ).scalars().first()
+    if record is None:
+        return None
+    registration = (record.status or "").strip().lower()
+    if not registration:
+        return None
+    return registration == "active"
+
+
+def _registry_signals(
+    session: Session, profile: CompanyProfile | None
+) -> tuple[str | None, bool | None]:
+    """Registry facts fit to score with, or nothing at all.
+
+    Nothing at all is the safe answer and the usual one: `score_buyer` reacts to
+    `company_status` only when it is something other than Active, and to
+    `gst_filing_regular` only when it is explicitly False. A buyer nobody has
+    verified therefore scores exactly as they did before any of this existed.
+
+    The tier gate is the whole point of the feature. Below IDENTIFIER a profile
+    is a resemblance — a similar name, or a figure somebody copied off a portal
+    — and a resemblance must not be allowed to decide whether a real company
+    gets credit. Only an identifier match, which the provenance rule reserves to
+    data a registry actually returned, opens this gate.
+    """
+    if profile is None or profile.resolution_tier != Tier.IDENTIFIER.value:
+        return None, None
+    return profile.status, _gst_filing_regular(session, profile)
+
+
 def _assessment_out(row: CreditAssessment, buyer_name: str) -> CreditCheckOut:
     return CreditCheckOut(
         id=row.id,
@@ -776,11 +1213,23 @@ def run_credit_check(
 
     ledger = _ledger_facts(session, buyer_id, now)
 
+    # What the registries say, but only if this buyer was resolved decisively.
+    profile = _buyer_profile(session, buyer_id)
+    company_status, gst_filing_regular = _registry_signals(session, profile)
+
     # Recovery risk is computed from our own ledger too, and is the heaviest
     # single input. A buyer we have never traded with has none, and the engine
-    # treats "no history" as weak evidence rather than as good news.
+    # treats "no history" as weak evidence rather than as good news — but a
+    # struck-off company is not a good risk merely because it has not owed us
+    # anything yet, so a registry signal is enough on its own to score.
     risk = None
-    if ledger.invoices_settled or ledger.currently_overdue_paise or ledger.max_days_past_due:
+    if (
+        ledger.invoices_settled
+        or ledger.currently_overdue_paise
+        or ledger.max_days_past_due
+        or company_status
+        or gst_filing_regular is False
+    ):
         risk = score_buyer(
             ScoringContext(
                 as_of=now.date(),
@@ -788,8 +1237,26 @@ def run_credit_check(
                 promise_kept_rate=ledger.promise_kept_rate,
                 outstanding_paise=ledger.currently_overdue_paise,
                 max_days_past_due=ledger.max_days_past_due,
+                company_status=company_status,
+                gst_filing_regular=gst_filing_regular,
             )
         )
+
+    # One question, one answer. A declared "GST registered?" tick and a resolved
+    # profile can disagree, and an assessment recording both is unreadable six
+    # months later when somebody asks which one the decision rested on. Where the
+    # buyer was resolved against a registry, what we resolved wins and the form is
+    # discarded — including when it says no and the registry returned a GSTIN.
+    #
+    # Gated on the same tier as `_registry_signals`, and for the same reason. A
+    # GSTIN somebody typed into the identity form is a claim; scoring it as a
+    # positive factor and filing it as `resolved_profile` would make the
+    # assessment say a registry confirmed something nobody checked.
+    gst_registered = body.gst_registered
+    gst_registered_source = "declared"
+    if profile is not None and profile.resolution_tier == Tier.IDENTIFIER.value:
+        gst_registered = bool(profile.gstin)
+        gst_registered_source = "resolved_profile"
 
     application = cw.CreditApplication(
         requested_limit_paise=requested,
@@ -800,7 +1267,7 @@ def run_credit_check(
         existing_exposure_paise=ledger.currently_overdue_paise,
         other_creditor_exposure_paise=other,
         trade_references=body.trade_references,
-        gst_registered=body.gst_registered,
+        gst_registered=gst_registered,
         turnover_verified=body.turnover_verified,
         notes=body.notes,
     )
@@ -823,7 +1290,13 @@ def run_credit_check(
             "years_trading": body.years_trading,
             "other_creditor_exposure_paise": other,
             "trade_references": body.trade_references,
-            "gst_registered": body.gst_registered,
+            "gst_registered": gst_registered,
+            # Which of the two answers was used, kept alongside the value so the
+            # assessment still explains itself after the profile has moved on.
+            "gst_registered_source": gst_registered_source,
+            "gst_registered_declared": body.gst_registered,
+            "registry_company_status": company_status,
+            "registry_gst_filing_regular": gst_filing_regular,
             "turnover_verified": body.turnover_verified,
             "notes": body.notes,
         },

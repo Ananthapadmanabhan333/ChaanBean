@@ -9,6 +9,7 @@ there is exactly one place that decides what 42,00,000 looks like.
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -146,6 +147,78 @@ class CompanyProfileOut(BaseModel):
     caller_ids: list[CallerIdOut] = []
     buyer_count: int = 0
     outstanding_display: str = "₹0"
+
+
+# --------------------------------------------- the *buyer's* legal identity
+#
+# `CompanyProfileIn`/`Out` above are the tenant describing themselves. These
+# describe a debtor, which is a different question with a different failure: get
+# the creditor's own name wrong and a notice looks unprofessional; get a
+# debtor's wrong and it is aimed at a company that owes nothing.
+
+
+class BuyerIdentityIn(BaseModel):
+    """What a person types about a buyer. Claims, all of it.
+
+    Every field here arrives from a keyboard, so nothing in it is evidence of
+    anything. It is stored so a lookup has something to look up — never as a
+    verification result.
+    """
+
+    legal_name: str | None = Field(default=None, max_length=300)
+    gstin: str | None = Field(default=None, max_length=15)
+    cin: str | None = Field(default=None, max_length=21)
+    # Accepted, hashed on arrival, and never echoed. See `BuyerIdentityOut`.
+    pan: str | None = Field(default=None, max_length=10)
+    registered_address: str | None = None
+    state_code: str | None = Field(default=None, max_length=2)
+
+
+class BuyerIdentityOut(BaseModel):
+    buyer_id: UUID
+    # The legal name once one is recorded, the trading name until then.
+    name: str
+    gstin: str | None = None
+    cin: str | None = None
+    # There is deliberately **no `pan` field**. A PAN is a national identifier;
+    # it goes in as a claim, is stored as a hash plus four characters, and does
+    # not come back out. A convenience field here would be the one place a
+    # database of them could be read back over HTTP.
+    pan_last4: str | None = None
+    registered_address: str | None = None
+    state_code: str | None = None
+
+
+class VerificationOut(BaseModel):
+    """One verification run, as it stood at `verified_at`.
+
+    `signals` carries the evidence both ways and `blockers` says, in sentences a
+    non-specialist can act on, why this is not publishable. Both are returned
+    even when the answer is yes — "we were sure" is not a reason.
+    """
+
+    buyer_id: UUID
+    buyer_name: str
+    tier: str
+    confidence: float
+    publishable: bool
+    gst_status: str | None = None
+    mca_status: str | None = None
+    signals: list[dict] = []
+    blockers: list[str] = []
+    candidate_id: UUID | None = None
+    verified_at: datetime | None = None
+
+
+class EntityCandidateReviewIn(BaseModel):
+    """A person's answer to "is this the same company?".
+
+    Two words, no third. There is no "probably" here on purpose: the whole
+    reason a candidate exists is that the machine already said "probably".
+    """
+
+    decision: Literal["CONFIRM", "REJECT"]
+    note: str | None = Field(default=None, max_length=500)
 
 
 class PhoneOut(BaseModel):

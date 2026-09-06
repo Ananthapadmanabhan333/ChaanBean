@@ -67,6 +67,20 @@ BUYERS = [
     ("Bhatt Ceramics",        66, 6_60_000_00, DndStatus.CLEAR,      1, AccountStatus.OVERDUE, EscalationLevel.L1, 0),
 ]
 
+# Identifiers as the creditor would have typed them off an invoice — declared,
+# not verified. Three line up with the registry fixtures in app/company/gst.py
+# and app/company/mca.py so verification has something to find; the fourth is a
+# mistyped GSTIN, which is the case that matters. One wrong character still
+# produces a well-shaped GSTIN, so a demo without one never shows the check that
+# stops a notice going to whichever real business owns the number that was
+# actually typed.
+DECLARED_IDENTIFIERS = {
+    "Sharma Traders":    ("27AABCS1429B1ZU", "U51909MH2011PTC219876"),
+    "Verma Steel Works": ("29AACCV3456D1ZB", "U27109KA2009PTC050123"),  # GST cancelled
+    "Nair Electricals":  ("33AADCN7890F1ZB", "U31200TN2007PTC064512"),  # struck off at the MCA
+    "Joshi Plastics":    ("07AAFCK4521M1ZA", None),                     # check digit is wrong
+}
+
 L1_BODY = (
     "Namaste {buyer_name}. This is a payment reminder from {company_name}. "
     "Invoice {invoice_ref} for {amount_words} is now {days_past_due} days overdue. "
@@ -189,12 +203,15 @@ def seed() -> dict:
         for index, (
             name, dpd, outstanding, dnd, scrub_age, status, level, delivered
         ) in enumerate(BUYERS):
+            declared_gstin, declared_cin = DECLARED_IDENTIFIERS.get(name, (None, None))
             buyer = Buyer(
                 company_id=company.id,
                 name=name,
                 external_ref=f"ACME-{index:03d}",
                 language="en-IN",
                 email=f"{name.split()[0].lower()}@example.test",
+                gstin=declared_gstin,
+                cin=declared_cin,
                 consent_withdrawn=(name == "Bhatt Ceramics"),
                 consent_withdrawn_at=NOW if name == "Bhatt Ceramics" else None,
             )
@@ -271,6 +288,8 @@ def seed() -> dict:
     print("  Deliberately refusable cases are included: an unscrubbed number, a")
     print("  stale scrub, a registered number, a dispute, a withdrawn consent, a")
     print("  balance below the L3 floor, and an UNAPPROVED L3 template.")
+    print("  Four buyers carry declared GSTIN/CIN: one clean, one cancelled at")
+    print("  GST, one struck off at the MCA, and one with a mistyped check digit.")
     return created
 
 

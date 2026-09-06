@@ -315,6 +315,21 @@
   .blockers ul { margin: 8px 0 0; padding-left: 18px; }
   .blockers li { font-size: 13px; color: var(--ink); margin-bottom: 4px; }
 
+  /* A parked entity candidate is neither a refusal nor a result — it is work
+     handed to a named person. Amber rather than red: nothing has gone wrong,
+     and nothing may be acted on either. */
+  .pending {
+    background: var(--warn-bg); border-radius: var(--r);
+    padding: 14px 16px; margin-bottom: 18px;
+  }
+  .pending b { font-size: 12.5px; color: var(--warn); }
+  .pending p { margin: 6px 0 0; font-size: 13px; color: var(--ink); }
+  .pending .hint { color: var(--ink-muted); }
+  .pending code {
+    font-size: 11.5px; background: rgba(255,255,255,.62);
+    padding: 1px 5px; border-radius: 4px;
+  }
+
   .why b { font-size: 12.5px; color: var(--navy-800); }
   table.factors { margin-top: 8px; }
   table.factors td { padding: 7px 0; font-size: 13px; border-bottom: 1px solid var(--line-soft); }
@@ -1240,7 +1255,8 @@ const RENDER = {
         <td class="num"><b>${esc(b.outstanding_display)}</b></td>
         <td class="num">${b.days_past_due || "—"}</td>
         <td>${b.consent_withdrawn ? pill("Withdrawn", "bad") : esc(b.language)}</td>
-        <td><button class="btn sm" data-credit="${b.id}" data-name="${esc(b.name)}">Check credit</button></td>
+        <td><button class="btn sm" data-credit="${b.id}" data-name="${esc(b.name)}">Check credit</button>
+          <button class="btn sm" data-verify="${esc(b.id)}" data-name="${esc(b.name)}">Verify</button></td>
       </tr>`;
     });
 
@@ -1300,9 +1316,10 @@ const RENDER = {
       </form>
 
       ${table(["Buyer","Primary number","Reachable",{label:"Outstanding",num:1},
-               {label:"Days overdue",num:1},"Language","Credit"], rows,
+               {label:"Days overdue",num:1},"Language","Actions"], rows,
               "No buyers yet. Add one above, or import a CSV.")}
       <div id="creditPanel"></div>
+      <div id="verifyPanel"></div>
     </section>`;
   },
 
@@ -1432,6 +1449,7 @@ function paint({ force = false } = {}) {
   });
   wireForms();
   wireCredit();
+  wireVerify();
   fitCharts();
 }
 
@@ -1542,7 +1560,9 @@ function wireCredit() {
     $("creditPanel").innerHTML = creditForm(btn.dataset.credit, btn.dataset.name);
     $("creditPanel").scrollIntoView({ behavior: "smooth", block: "start" });
     $("ccLimit").focus();
-    $("creditClose").onclick = () => { $("creditPanel").innerHTML = ""; formOpen = false; };
+    // panelsOpen(), not `false`: the verify panel can be open beside this one,
+    // and un-pausing the poll here would repaint it away mid-sentence.
+    $("creditClose").onclick = () => { $("creditPanel").innerHTML = ""; formOpen = panelsOpen(); };
 
     $("creditForm").onsubmit = async (e) => {
       e.preventDefault();
@@ -1599,6 +1619,336 @@ function wireDecision(assessment) {
       submit.disabled = false;
     }
   };
+}
+
+/* ------------------------------------------------------ entity verification
+   Two stages, because they are two different acts, and the gap between them is
+   the whole point. Stage one records what somebody believes this buyer's
+   identifiers are — a claim, stored as self-declared however senior the person
+   typing it. Stage two asks the registers whether the claim survives contact
+   with them.
+
+   A claim can never reach IDENTIFIER and can never become publishable, however
+   confident it reads back. Only a record fetched from a registry can. So
+   nothing in this panel is allowed to let a saved identity look like a verified
+   one: the copy says claim, the tier is painted from the server's word rather
+   than from anything typed here, and a review outcome is re-read rather than
+   narrated. */
+
+const TIER_KIND = {
+  IDENTIFIER: "ok",
+  STRUCTURAL: "warn",
+  NAME_STRONG: "warn",
+  NAME_WEAK: "bad",
+  NONE: "bad",
+};
+// An unrecognised tier is painted bad, not warn. A tier this page has never
+// heard of is one it cannot vouch for.
+const tierKind = (t) => TIER_KIND[t] || "bad";
+
+/* Registry statuses arrive in the register's own casing ("Struck Off"), so the
+   match is case-insensitive — and anything unrecognised stays neutral grey
+   rather than being guessed into green. */
+const REGISTRY_OK = ["active"];
+const REGISTRY_BAD = ["cancelled", "suspended", "struck off", "under liquidation"];
+function registryPill(status) {
+  if (!status) return pill("Not checked");
+  const key = String(status).trim().toLowerCase();
+  return pill(status, REGISTRY_OK.includes(key) ? "ok"
+                    : REGISTRY_BAD.includes(key) ? "bad" : "");
+}
+
+/* Confidence is a 0–1 fraction. A value above 1 can only already be a
+   percentage, and printing 90 as 9000% would be a worse lie than the guard. */
+const confidencePct = (n) => {
+  const v = Number(n) || 0;
+  return Math.round(v > 1 ? v : v * 100);
+};
+
+/* The console is only ever told role names — /portal/state sends `roles`, never
+   the permission set they expand to — so this mirrors the server's own two
+   facts: a role that grants entity:confirm, or an API-key scope that names the
+   permission outright. It hides a button and grants nothing. The server refuses
+   the call regardless, which is the check that actually protects anyone; this
+   one only stops us offering an action the person cannot take. */
+const ENTITY_CONFIRM_ROLES = ["owner", "admin"];
+function canConfirmEntity() {
+  const roles = cache.user?.roles || [];   // paint runs before load resolves
+  return roles.some(r => r === "entity:confirm" || ENTITY_CONFIRM_ROLES.includes(r));
+}
+
+/* Two panels can be open on this view at once, so "is a form open" is a
+   question about both — closing one must not un-pause the poll and repaint the
+   other away with someone's half-typed identity still in it. */
+function panelsOpen() {
+  return ["creditPanel", "verifyPanel"].some(id => ($(id)?.innerHTML ?? "") !== "");
+}
+
+function verifyForm(buyerId, name) {
+  return `<div class="card addform" id="verifyCard" data-buyer="${esc(buyerId)}">
+    <div class="panel-head">
+      <div><h3>Identity &#8212; ${esc(name)}</h3>
+        <p>Who this buyer is on the public record, and whether we may act on it.</p></div>
+      <button class="btn sm" id="verifyClose">Close</button>
+    </div>
+
+    <form id="identityForm">
+      <div class="formgrid">
+        <div class="field"><label for="viName">Registered legal name</label>
+          <input id="viName" maxlength="300" placeholder="${esc(name)}">
+          <div class="hint">As registered, not as invoiced.</div></div>
+        <div class="field"><label for="viGstin">GSTIN <span>optional</span></label>
+          <!-- Check-digit valid, because the hint below is about check digits:
+               an example the server would refuse teaches the wrong lesson. -->
+          <input id="viGstin" maxlength="15" placeholder="33AADCN7890F1ZB">
+          <div class="hint">Checked character by character against the register.
+            One wrong digit is a <b>different real company</b> &#8212; so a mismatch
+            is refused outright, never accepted at a lower score.</div></div>
+        <div class="field"><label for="viCin">CIN <span>optional</span></label>
+          <input id="viCin" maxlength="21" placeholder="U27100TN2011PTC079123"></div>
+        <div class="field"><label for="viPan">PAN <span>optional</span></label>
+          <input id="viPan" maxlength="10" placeholder="AABCS1429B">
+          <div class="hint" id="viPanNote">Stored hashed &#8212; only the last four
+            characters are kept where a person can read them.</div></div>
+        <div class="field"><label for="viState">State code <span>optional</span></label>
+          <input id="viState" maxlength="2" placeholder="33">
+          <div class="hint">The first two digits of the GSTIN. A contradiction here
+            counts as evidence against the match, not as a detail.</div></div>
+        <div class="field wide"><label for="viAddr">Registered address <span>optional</span></label>
+          <input id="viAddr" maxlength="500" placeholder="12 Mount Road, Chennai 600002"></div>
+      </div>
+      <div class="err" id="viErr"></div>
+      <div class="formactions">
+        <button type="submit" class="btn">Save these identifiers</button>
+      </div>
+      <p class="hint">Typed here, these are <b>claims</b> &#8212; recorded as
+        self-declared, whoever typed them. A claim can raise a question for the
+        register to answer. It can never be the answer.</p>
+    </form>
+
+    <div class="subhead">Check it against the register
+      <span>the only thing that can verify anyone</span></div>
+    <p class="hint" style="margin-top:0">Runs the GST and MCA lookups and matches what
+      comes back against the identifiers above. Save them first &#8212; with nothing to
+      check, the server refuses and names the refusal.</p>
+    <div class="err" id="vrErr"></div>
+    <div class="formactions">
+      <button class="btn primary" id="verifyRun">Run verification</button>
+    </div>
+    <div id="verifyResult"></div>
+  </div>`;
+}
+
+function verifyResult(v) {
+  // Empty-array fallbacks throughout: this renders from a server payload, and a
+  // missing list must read as "nothing recorded", not throw and show nothing.
+  const signals = v.signals || [];
+  const blockers = v.blockers || [];
+  const roles = cache.user?.roles || [];
+  const candidateId = v.candidate_id;
+
+  /* Every signal, in the order the server ranked them, and none dropped. The
+     one worth reading is usually the one arguing against. */
+  const signalRows = signals.map(s => {
+    // The key a signal's sentence travels under is not fixed by the contract,
+    // so take the first that reads like one, and fall back to the machine name
+    // rather than printing an empty row.
+    const text = s.sentence || s.note || s.explanation || s.detail || "";
+    const meta = [s.name, s.value]
+      .filter(x => x !== null && x !== undefined && x !== "").join(" · ");
+    const verdict = s.supports === false ? pill("Against", "bad")
+                  : s.supports === true  ? pill("Supports", "ok")
+                  : pill("Noted");
+    return `<tr>
+      <td>${esc(text || meta)}${text && meta ? `<div class="sub">${esc(meta)}</div>` : ""}</td>
+      <td class="num">${verdict}</td></tr>`;
+  }).join("");
+
+  const blockerBlock = blockers.length ? `
+    <div class="blockers">
+      <b>Why this is not an endorsement</b>
+      <ul>${blockers.map(b => `<li>${esc(b)}</li>`).join("")}</ul>
+    </div>` : "";
+
+  // Below IDENTIFIER, nothing has been decided — it has been parked. Say so in
+  // those words, and say who is allowed to unpark it.
+  const pendingBlock = v.tier === "IDENTIFIER" ? "" : `
+    <div class="pending">
+      <b>Parked for a person</b>
+      ${candidateId ? `<p>Held as candidate <code>${esc(candidateId)}</code>.
+        Somebody holding <code>entity:confirm</code> has to read it and say whether
+        this is the same company. Until they do, this buyer counts as
+        <b>unverified</b>: nothing here may be published, and no notice may be
+        addressed to the company named above.</p>`
+      : `<p>Nothing matched closely enough to park as a candidate. This buyer counts
+        as <b>unverified</b>: nothing here may be published, and no notice may be
+        addressed on the strength of it.</p>`}
+      ${candidateId && canConfirmEntity() ? `
+        <div class="formactions">
+          <button class="btn primary" data-confirm="${esc(candidateId)}">Confirm &#8212; same company</button>
+          <button class="btn" data-reject="${esc(candidateId)}">Reject &#8212; not the same</button>
+        </div>
+        <div class="err" id="ecErr"></div>` : ""}
+      ${candidateId && !canConfirmEntity() ? `<p class="hint">Signed in as
+        <b>${esc(roles.join(", ") || "no role")}</b>, which does not hold
+        <code>entity:confirm</code>, so that decision is not offered here. The server
+        refuses it as well &#8212; this is a tidier screen, not the safeguard.</p>` : ""}
+    </div>`;
+
+  return `<div class="result">
+    <div class="reshead">
+      ${pill(v.tier || "NONE", tierKind(v.tier))}
+      <div><b>${confidencePct(v.confidence)}%</b><span>confidence in the match</span></div>
+      <div class="score">${v.publishable
+        ? pill("May be acted on", "ok")
+        : pill("Not publishable", "bad")}</div>
+    </div>
+    <div class="legend" style="margin:-8px 0 18px">
+      <span>GST ${registryPill(v.gst_status)}</span>
+      <span>MCA ${registryPill(v.mca_status)}</span>
+    </div>
+    ${blockerBlock}
+    ${pendingBlock}
+    <div class="why">
+      <b>Every signal, for and against</b>
+      ${signals.length
+        ? `<table class="factors"><tbody>${signalRows}</tbody></table>`
+        : `<p class="hint">No signals were recorded. That is itself a reason to read
+             this as unverified rather than as clean.</p>`}
+      <p class="hint">Run ${esc(v.verified_at ?? "—")} against
+        <b>${esc(v.buyer_name ?? "")}</b>. Running it again writes a new record rather
+        than replacing this one, so what was known today stays answerable later.</p>
+    </div>
+  </div>`;
+}
+
+function wireVerify() {
+  document.querySelectorAll("[data-verify]").forEach(btn => btn.onclick = () => {
+    const host = $("verifyPanel");
+    if (!host) return;
+    const buyerId = btn.dataset.verify;
+    // Every await below can land after the operator has closed the panel or
+    // opened another buyer's. This is how each one asks whether it still owns
+    // the screen before writing to it.
+    const stillOurs = () => $("verifyCard")?.dataset.buyer === buyerId;
+
+    formOpen = true;
+    host.innerHTML = verifyForm(buyerId, btn.dataset.name);
+    host.scrollIntoView({ behavior: "smooth", block: "start" });
+    $("viName").focus();
+    $("verifyClose").onclick = () => { host.innerHTML = ""; formOpen = panelsOpen(); };
+
+    // Whatever was decided last time, shown before anything is re-run: someone
+    // about to verify a buyer should see the outcome that already exists. A 404
+    // here is the ordinary case — never verified — and not worth an error line.
+    api(`/trade/buyers/${buyerId}/verification`).then(v => {
+      if (!stillOurs()) return;
+      $("verifyResult").innerHTML = verifyResult(v);
+      wireReview(buyerId);
+    }).catch(() => {});
+
+    $("identityForm").onsubmit = async (e) => {
+      e.preventDefault();
+      const err = $("viErr");
+      err.textContent = ""; err.style.color = "";
+      const submit = $("identityForm").querySelector('button[type="submit"]');
+      submit.disabled = true;
+      try {
+        const name = $("viName").value.trim();
+        const saved = await api(`/trade/buyers/${buyerId}/identity`, {
+          method: "PUT",
+          body: JSON.stringify({
+            // The shared contract fixes `name` on the way back; every other form
+            // in this file calls the same thing `legal_name`. The request shape
+            // is not in the contract, so both spellings go and the server takes
+            // whichever it declares.
+            name, legal_name: name,
+            gstin: $("viGstin").value.trim().toUpperCase() || null,
+            cin: $("viCin").value.trim().toUpperCase() || null,
+            pan: $("viPan").value.trim().toUpperCase() || null,
+            registered_address: $("viAddr").value.trim() || null,
+            state_code: $("viState").value.trim() || null,
+          }),
+        });
+        if (!stillOurs()) return;
+        // Show what was stored rather than what was typed: the server
+        // normalises, and the PAN comes back as four characters because the
+        // rest of it is not kept anywhere readable.
+        $("viName").value = saved.name ?? name;
+        $("viGstin").value = saved.gstin ?? "";
+        $("viCin").value = saved.cin ?? "";
+        $("viState").value = saved.state_code ?? "";
+        $("viAddr").value = saved.registered_address ?? "";
+        $("viPan").value = "";
+        if (saved.pan_last4) {
+          $("viPanNote").innerHTML = `Stored as &#8230;${esc(saved.pan_last4)}
+            &#8212; the full number is hashed and is not shown again.`;
+        }
+        err.textContent = "Saved as a claim. Nothing is verified until the register agrees.";
+        err.style.color = "var(--green-700)";
+      } catch (ex) {
+        err.textContent = String(ex.message || ex);
+      } finally {
+        submit.disabled = false;
+      }
+    };
+
+    $("verifyRun").onclick = async () => {
+      const err = $("vrErr"); err.textContent = "";
+      const run = $("verifyRun");
+      run.disabled = true;
+      try {
+        // "{}" rather than no body: an endpoint that declares no body ignores
+        // it, and one that declares an all-optional body needs it.
+        const v = await api(`/trade/buyers/${buyerId}/verify`, { method: "POST", body: "{}" });
+        if (!stillOurs()) return;
+        $("verifyResult").innerHTML = verifyResult(v);
+        wireReview(buyerId);
+      } catch (ex) {
+        err.textContent = String(ex.message || ex);
+      } finally {
+        run.disabled = false;
+      }
+    };
+  });
+}
+
+/* Re-wired from verifyResult's own insertion point rather than from paint(),
+   because these two buttons exist only inside an outcome that was fetched. */
+function wireReview(buyerId) {
+  document.querySelectorAll("[data-confirm], [data-reject]").forEach(btn => btn.onclick = async () => {
+    const confirmed = btn.hasAttribute("data-confirm");
+    const candidateId = confirmed ? btn.dataset.confirm : btn.dataset.reject;
+    const err = $("ecErr");
+    if (err) err.textContent = "";
+    btn.disabled = true;
+    try {
+      const done = await api(`/trade/entity-candidates/${candidateId}/review`, {
+        method: "POST",
+        // `status` is what the contract calls this value coming back;
+        // `decision` is what a request would call it. The request shape is not
+        // in the contract, so both go and the server takes the one it declares.
+        body: JSON.stringify({
+          decision: confirmed ? "CONFIRM" : "REJECT",
+          status: confirmed ? "CONFIRMED" : "REJECTED",
+        }),
+      });
+      // Deliberately no re-read. A review writes no verification report, so
+      // GET /verification still returns the run that proposed this candidate —
+      // repainting from it would redraw the identical "Parked for a person"
+      // block with live buttons, and the next click would come back 409. So
+      // state only what the server just said, and take the choice away.
+      const host = $("verifyResult");
+      if (!host) return;
+      host.querySelectorAll("[data-confirm], [data-reject]").forEach(b => b.remove());
+      host.insertAdjacentHTML("beforeend", `<div class="decided">Recorded as
+        <b>${esc(done.status ?? (confirmed ? "CONFIRMED" : "REJECTED"))}</b>. Run the
+        check again to see the profile this left behind.</div>`);
+    } catch (ex) {
+      if (err) err.textContent = String(ex.message || ex);
+      btn.disabled = false;
+    }
+  });
 }
 
 /* ------------------------------------------------------------------- forms

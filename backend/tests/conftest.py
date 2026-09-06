@@ -23,10 +23,15 @@ from app.models import (
     CompanyProfile,
     CreditAccount,
     CreditAssessment,
+    EntityCandidate,
+    GstRecord,
     Invoice,
     DndStatus,
+    McaRecord,
+    ProviderFetch,
     RoleGrant,
     User,
+    VerificationReport,
 )
 
 
@@ -133,9 +138,26 @@ def tenants():
     with admin_session() as s:
         for cid in created:
             s.execute(delete(AuditLog).where(AuditLog.company_id == cid))
-            # The creditor profile references the company, so it has to go
-            # before the company does.
+            # Company intelligence, innermost first. Verification reports, GST
+            # and MCA records all point at a company_profiles row, so every one
+            # of them has to be gone before the profiles are — and the profiles
+            # (both the creditor's own and the buyer-scoped ones) before the
+            # company and the buyers they reference.
+            #
+            # This list is hand-maintained and nothing checks it, so a table
+            # added upstream and forgotten here does not fail its own test: it
+            # fails teardown on a foreign key, in whichever unrelated test
+            # happens to run next.
+            s.execute(
+                delete(VerificationReport).where(VerificationReport.company_id == cid)
+            )
+            s.execute(delete(GstRecord).where(GstRecord.company_id == cid))
+            s.execute(delete(McaRecord).where(McaRecord.company_id == cid))
             s.execute(delete(CompanyProfile).where(CompanyProfile.company_id == cid))
+            # Candidates reference buyers and users rather than profiles, so
+            # they need only precede those two.
+            s.execute(delete(EntityCandidate).where(EntityCandidate.company_id == cid))
+            s.execute(delete(ProviderFetch).where(ProviderFetch.company_id == cid))
             s.execute(delete(CreditAssessment).where(CreditAssessment.company_id == cid))
             s.execute(delete(CreditAccount).where(CreditAccount.company_id == cid))
             # Buyers can now be created with an opening invoice, and the

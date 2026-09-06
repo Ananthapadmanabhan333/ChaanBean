@@ -83,6 +83,19 @@ class GstRecord(Base, TimestampMixin):
     registration_date: Mapped[date | None] = mapped_column(Date)
     address: Mapped[str | None] = mapped_column(Text)
     filing_history: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
+    # REGISTRY or USER_PROVIDED — see app.providers.base. These rows are
+    # append-only evidence, so a year from now "what did we know in March" has to
+    # distinguish a record fetched from the register from one a person read off a
+    # portal and typed. Without this column the two are indistinguishable, and a
+    # self-declared GSTIN quietly acquires the standing of a verified one.
+    #
+    # Defaults to USER_PROVIDED, not REGISTRY: a writer that forgets to say where
+    # its data came from has not earned the stronger label, and understating
+    # provenance costs a re-verification while overstating it publishes a claim
+    # about a company nobody checked.
+    provenance: Mapped[str] = mapped_column(
+        String(16), default="USER_PROVIDED", server_default="USER_PROVIDED", nullable=False
+    )
     fetched_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -102,6 +115,10 @@ class McaRecord(Base, TimestampMixin):
     directors: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
     charges: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
     paid_up_capital_paise: Mapped[int | None] = mapped_column(String(32))
+    # As on GstRecord: where this came from, defaulting to the weaker claim.
+    provenance: Mapped[str] = mapped_column(
+        String(16), default="USER_PROVIDED", server_default="USER_PROVIDED", nullable=False
+    )
     fetched_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

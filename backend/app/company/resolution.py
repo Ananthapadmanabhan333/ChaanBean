@@ -18,6 +18,7 @@ token-set similarity rather than edit distance.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -164,9 +165,28 @@ def state_from_gstin(gstin: str | None) -> str | None:
 
 
 def hash_pan(pan: str) -> tuple[str, str]:
-    """(hash, last four). The full number is never stored in the clear."""
+    """(keyed digest, last four). The full number is never stored in the clear.
+
+    Keyed, not a bare digest, because the row keeps `pan_last4` beside the hash.
+    Those four characters fix the trailing digits and the check letter, leaving
+    26^5 x 10 ≈ 10^8 candidates for the rest — which an unsalted SHA-256 gives up
+    in seconds, and with it the national identifier the column exists to protect.
+    Under an HMAC a dump without the pepper yields nothing.
+
+    Rotating `pan_pepper` invalidates every digest already written. Nothing
+    compares one against a number typed later today, so that costs a
+    re-verification rather than a lookup.
+    """
+    # Imported here rather than at module scope: everything else in this file is
+    # pure comparison logic, and importing it should not require a configured
+    # environment.
+    from app.config import settings
+
     clean = pan.upper().strip()
-    return hashlib.sha256(clean.encode()).hexdigest(), clean[-4:]
+    digest = hmac.new(
+        settings.pan_pepper.encode(), f"pan:{clean}".encode(), hashlib.sha256
+    ).hexdigest()
+    return digest, clean[-4:]
 
 
 # ---------------------------------------------------------------- resolution
@@ -185,6 +205,14 @@ def resolve(candidate: EntityInput, record: SourceRecord) -> Resolution:
     ):
         if left and right and left.upper() == right.upper():
             signals.append(Signal(kind, left.upper(), True, 1.0, "exact identifier match"))
+            # Computed even though the tier is already settled, and reported
+            # rather than weighed. A mistyped but checksum-valid GSTIN matches a
+            # stranger's record exactly, and the only trace of that on the screen
+            # is a name the two do not share — so it has to be on the screen.
+            overlap = token_set_similarity(candidate.name, record.name)
+            signals.append(
+                Signal("name_similarity", f"{overlap:.2f}", overlap >= 0.6, overlap)
+            )
             return Resolution(Tier.IDENTIFIER, 1.0, tuple(signals))
 
     # Tier 2 — structural. A GSTIN embeds a PAN, so two GSTINs sharing a PAN are
