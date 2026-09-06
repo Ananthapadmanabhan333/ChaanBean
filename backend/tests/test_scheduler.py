@@ -364,7 +364,34 @@ def test_dispute_raised_after_scheduling_blocks_dispatch(world):
 
 def test_blocks_are_recorded_with_a_reason_and_a_retry_time(world):
     """How you prove compliance, and how you debug a campaign that is not
-    calling anyone."""
+    calling anyone.
+
+    A weekend rather than a withdrawal, because the retry time is for refusals
+    the passage of time clears. Consent is the one it never does — see below.
+    """
+    saturday = datetime(2026, 3, 14, 6, 0, tzinfo=timezone.utc)
+    with tenant_session(world.company_id) as s:
+        buyer = s.get(Buyer, world.buyer_id)
+        campaign = s.get(Campaign, world.campaign_id)
+        result = dispatch_buyer(
+            s, buyer=buyer, campaign=campaign, **dispatch_kwargs(world, now=saturday)
+        )
+        call = s.get(Call, result.call_id)
+
+        assert call.status is CallStatus.BLOCKED
+        assert call.block_reason == BlockReason.WEEKEND_NOT_PERMITTED.value
+        assert call.counts_against_cap is False
+        assert buyer.next_action_at > saturday
+
+
+def test_a_withdrawal_parks_the_buyer_rather_than_scheduling_a_retry(world):
+    """Four hours is the wrong answer to "they asked us to stop".
+
+    `record_consent_withdrawal` nulls `next_action_at` deliberately, and a retry
+    written here undoes it: the scheduler then wakes on this person six times a
+    day indefinitely, writes the same refusal each time, and keeps their
+    campaign target alive because the sweep reads a wake-up as unfinished work.
+    """
     with tenant_session(world.company_id) as s:
         buyer = s.get(Buyer, world.buyer_id)
         buyer.consent_withdrawn = True
@@ -372,10 +399,8 @@ def test_blocks_are_recorded_with_a_reason_and_a_retry_time(world):
         result = dispatch_buyer(s, buyer=buyer, campaign=campaign, **dispatch_kwargs(world))
         call = s.get(Call, result.call_id)
 
-        assert call.status is CallStatus.BLOCKED
         assert call.block_reason == BlockReason.CONSENT_WITHDRAWN.value
-        assert call.counts_against_cap is False
-        assert buyer.next_action_at > NOW
+        assert buyer.next_action_at is None
 
 
 def test_a_blocked_call_does_not_consume_the_cap(world):

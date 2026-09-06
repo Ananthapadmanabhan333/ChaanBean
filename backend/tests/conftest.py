@@ -17,19 +17,43 @@ from app.db import admin_session, engine, worker_engine
 from app.identity.auth import hash_password
 from app.models import (
     AuditLog,
+    BlackoutDate,
     Buyer,
     BuyerPhone,
+    Call,
+    CallEvent,
+    Campaign,
+    CampaignTarget,
+    CaseParty,
+    ChannelOptOut,
     Company,
     CompanyProfile,
+    CourtCase,
     CreditAccount,
     CreditAssessment,
+    CreditNote,
     EntityCandidate,
+    EscalationState,
     GstRecord,
     Invoice,
     DndStatus,
+    LegalHistory,
+    LegalLink,
+    LegalMatter,
+    LegalNotice,
     McaRecord,
+    Message,
+    MessageEvent,
+    Payment,
+    PaymentAllocation,
+    PaymentBehaviour,
+    PrelegalAssessment,
+    Promise,
     ProviderFetch,
+    Return,
     RoleGrant,
+    Seller,
+    Statement,
     User,
     VerificationReport,
 )
@@ -153,19 +177,67 @@ def tenants():
             )
             s.execute(delete(GstRecord).where(GstRecord.company_id == cid))
             s.execute(delete(McaRecord).where(McaRecord.company_id == cid))
+            # Court records join the same chain: a legal link and an issued
+            # legal history both name a company_profiles row, so they belong
+            # above the profiles too — not down with the rest of the legal
+            # tables, which hang off credit accounts instead. Innermost first: a
+            # matter cites a notice, a notice cites an assessment, and links and
+            # parties both hang off the case.
+            s.execute(delete(LegalMatter).where(LegalMatter.company_id == cid))
+            s.execute(delete(LegalNotice).where(LegalNotice.company_id == cid))
+            s.execute(
+                delete(PrelegalAssessment).where(PrelegalAssessment.company_id == cid)
+            )
+            s.execute(delete(LegalHistory).where(LegalHistory.company_id == cid))
+            s.execute(delete(LegalLink).where(LegalLink.company_id == cid))
+            s.execute(delete(CaseParty).where(CaseParty.company_id == cid))
+            s.execute(delete(CourtCase).where(CourtCase.company_id == cid))
             s.execute(delete(CompanyProfile).where(CompanyProfile.company_id == cid))
             # Candidates reference buyers and users rather than profiles, so
             # they need only precede those two.
             s.execute(delete(EntityCandidate).where(EntityCandidate.company_id == cid))
             s.execute(delete(ProviderFetch).where(ProviderFetch.company_id == cid))
             s.execute(delete(CreditAssessment).where(CreditAssessment.company_id == cid))
+            # Everything from here down is what the HTTP surface can now create,
+            # traced foreign key by foreign key rather than guessed at. The order
+            # is one chain: contact rows point at campaigns and accounts, legal
+            # rows point at accounts and profiles, ledger movements point at
+            # payments and invoices, and all of them point at buyers.
+            s.execute(delete(CallEvent).where(CallEvent.company_id == cid))
+            s.execute(delete(MessageEvent).where(MessageEvent.company_id == cid))
+            s.execute(delete(Call).where(Call.company_id == cid))
+            s.execute(delete(Message).where(Message.company_id == cid))
+            s.execute(delete(CampaignTarget).where(CampaignTarget.company_id == cid))
+            s.execute(delete(Campaign).where(Campaign.company_id == cid))
+            s.execute(delete(ChannelOptOut).where(ChannelOptOut.company_id == cid))
+            s.execute(delete(BlackoutDate).where(BlackoutDate.company_id == cid))
+            s.execute(delete(Promise).where(Promise.company_id == cid))
+            s.execute(delete(PaymentBehaviour).where(PaymentBehaviour.company_id == cid))
+            # Ledger movements before the documents they move against: a return
+            # cites a credit note, and both an allocation and a note cite the
+            # invoice.
+            s.execute(delete(Return).where(Return.company_id == cid))
+            s.execute(delete(CreditNote).where(CreditNote.company_id == cid))
+            s.execute(
+                delete(PaymentAllocation).where(PaymentAllocation.company_id == cid)
+            )
+            s.execute(delete(Payment).where(Payment.company_id == cid))
+            s.execute(delete(Statement).where(Statement.company_id == cid))
+            # The ladder is keyed on the account, so it goes immediately before
+            # it. Raising *or* clearing a dispute creates this row even for an
+            # account that never had one.
+            s.execute(delete(EscalationState).where(EscalationState.company_id == cid))
             s.execute(delete(CreditAccount).where(CreditAccount.company_id == cid))
             # Buyers can now be created with an opening invoice, and the
             # account references it, so invoices go after accounts and before
             # the buyers that own them.
             s.execute(delete(Invoice).where(Invoice.company_id == cid))
+            s.execute(delete(Seller).where(Seller.company_id == cid))
             s.execute(delete(BuyerPhone).where(BuyerPhone.company_id == cid))
             s.execute(delete(Buyer).where(Buyer.company_id == cid))
             s.execute(delete(RoleGrant).where(RoleGrant.company_id == cid))
+            # Users go last but one: `invoices.closed_by` and `promises.recorded_by`
+            # both name the person who decided, so every row above has to have
+            # gone first.
             s.execute(delete(User).where(User.company_id == cid))
             s.execute(delete(Company).where(Company.id == cid))

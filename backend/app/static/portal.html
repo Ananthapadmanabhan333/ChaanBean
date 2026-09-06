@@ -345,6 +345,41 @@
   /* The reference under a buyer's name — present but not competing with it. */
   td .sub { font-size: 11.5px; color: var(--ink-faint); margin-top: 2px; }
 
+  /* --------------------------------------------------------- row actions */
+  /* Four to a row on the ledger, so they wrap inside the cell rather than
+     widening the table past the edge of its own card. */
+  .acts { display: flex; gap: 6px; flex-wrap: wrap; }
+  /* A credit note, a write-off and a cancellation each end with a debtor being
+     told a different number. They should not look like "Pause". */
+  button.btn.danger { color: var(--danger); border-color: #EFC9C5; }
+  button.btn.danger:hover { background: var(--danger-bg); }
+  .noperm { font-size: 11.5px; color: var(--ink-faint); white-space: nowrap; }
+  .noperm code { background: var(--line-soft); padding: 1px 4px; border-radius: 4px; }
+
+  /* Said once per view, never once per row: an action this console cannot
+     address yet is a fact about the API, not about this invoice. */
+  .gapnote {
+    background: var(--warn-bg); border-radius: var(--r);
+    padding: 12px 14px; margin-bottom: 14px;
+    font-size: 12.5px; color: var(--ink); line-height: 1.55;
+  }
+  .gapnote b { color: var(--warn); }
+  .gapnote code {
+    font-size: 11.5px; background: rgba(255,255,255,.62);
+    padding: 1px 5px; border-radius: 4px;
+  }
+
+  /* --------------------------------------------------------- the day's work
+     Sits above the hero. A queue nobody opens is the same as no queue. */
+  .today .row {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding-top: 10px; margin-top: 10px; border-top: 1px solid var(--line-soft);
+  }
+  .today .row b { font-size: 13.5px; color: var(--navy-800); }
+  .today .row .why { font-size: 12.5px; color: var(--ink-muted); flex: 1 1 240px; }
+  .today .amt { font-variant-numeric: tabular-nums; font-weight: 600; margin-left: auto; }
+  .queueclear { font-size: 13px; color: var(--ink-muted); margin: 0; }
+
   /* ------------------------------------------------------------------ login */
   .login-wrap {
     min-height: 100vh; display: grid; grid-template-columns: 1fr 1fr;
@@ -564,6 +599,12 @@
        or empty page the top bar inflated to half the viewport. `auto 1fr` pins
        the bar to its content and gives the slack to main instead. */
     .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    /* A `1fr` track still carries `min-width: auto`, so it refuses to shrink
+       below its contents' min-content width — and one table of nowrap cells was
+       therefore widening the whole page, dragging the sidebar out with it and
+       leaving the `.scroll` wrappers nothing to scroll. The grid items have to
+       say they may be narrower than what is inside them. */
+    .app > aside, .app > div, main { min-width: 0; }
     aside {
       position: sticky; top: 0; height: auto; z-index: 30;
       flex-direction: row; align-items: center; gap: 4px;
@@ -805,21 +846,131 @@ const REASONS = {
   CONTACT_NOT_ALLOWLISTED: "Non-production refused to contact a real number.",
 };
 
+/* Sentence case for readability, but L1/L2/L3 and DND stay upper — they are
+   names, and "l3 template" reads as a typo. Shared: the Overview labels a
+   refusal chart with it and the review queue labels a ladder event with it,
+   and two spellings of one enum name on one screen is a bug in waiting. */
+const humanise = (r) => String(r || "").toLowerCase().replace(/_/g, " ")
+  .replace(/\b(l1|l2|l3|dnd|sms)\b/g, m => m.toUpperCase())
+  .replace(/^./, c => c.toUpperCase());
+
 const ICON = {
   overview: '<path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/>',
+  review: '<path d="M9 4H7a2 2 0 00-2 2v13a2 2 0 002 2h10a2 2 0 002-2V6a2 2 0 00-2-2h-2"/><rect x="9" y="2" width="6" height="4" rx="1"/><path d="M9 13.5l2 2 4-4"/>',
   campaigns: '<path d="M3 11l18-8-8 18-2-8-8-2z"/>',
   refusals: '<circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/>',
   calls: '<path d="M22 16.9v3a2 2 0 01-2.2 2 19.8 19.8 0 01-8.6-3.1 19.5 19.5 0 01-6-6A19.8 19.8 0 012.1 4.2 2 2 0 014.1 2h3a2 2 0 012 1.7c.1 1 .4 1.9.7 2.8a2 2 0 01-.5 2.1L8.1 9.9a16 16 0 006 6l1.3-1.3a2 2 0 012.1-.4c.9.3 1.8.6 2.8.7a2 2 0 011.7 2z"/>',
   messages: '<path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>',
   ledger: '<path d="M4 3h12l4 4v14H4z"/><path d="M8 12h8M8 16h5"/>',
+  payments: '<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2.6"/><path d="M6 12h.01M18 12h.01"/>',
   buyers: '<path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.9"/><path d="M16 3.1a4 4 0 010 7.8"/>',
   profile: '<path d="M3 21V8l9-5 9 5v13"/><path d="M9 21v-6h6v6"/><path d="M9 11h.01M15 11h.01"/>',
 };
+/* Review sits second because it is the only view that is a to-do list: every
+   row in it is an account the machine has stopped working on until a person
+   looks, and a queue filed below the fold is a queue that grows. */
 const VIEWS = [
-  ["overview", "Overview"], ["buyers", "Credit buyers"], ["campaigns", "Campaigns"],
-  ["refusals", "Refusals"], ["calls", "Calls"], ["messages", "Messages"],
-  ["ledger", "Accounts"], ["profile", "Company"],
+  ["overview", "Overview"], ["review", "Review"], ["buyers", "Credit buyers"],
+  ["campaigns", "Campaigns"], ["refusals", "Refusals"], ["calls", "Calls"],
+  ["messages", "Messages"], ["ledger", "Accounts"], ["payments", "Payments"],
+  ["profile", "Company"],
 ];
+
+/* ------------------------------------------------------------- permissions
+   app/identity/rbac.py mirrored, value for value. The console is only ever
+   told role names — /portal/state sends `roles`, never the permission set they
+   expand to — so the expansion has to happen here to know whether to offer a
+   button at all.
+
+   This grants nothing. Every route below re-checks with `require(...)` and
+   refuses regardless, which is the check that actually protects anyone; this
+   one only stops the screen offering an act the person cannot take, which is
+   worse than useless because they find out by 403 after typing a reason.
+
+   Deny by default, as there: a role name this table has never heard of grants
+   nothing rather than everything. */
+const _READ_ONLY = ["buyer:read", "campaign:read", "call:read", "report:read", "template:read"];
+const _OPERATOR = _READ_ONLY.concat([
+  "buyer:write", "import:run", "campaign:write", "campaign:start",
+  "template:write", "company:verify",
+]);
+const _ADMIN = _OPERATOR.concat([
+  "user:manage", "apikey:manage", "company:settings", "audit:read",
+  "entity:confirm", "ledger:credit", "ledger:write_off", "dispute:clear",
+  "consent:restore", "legal:link_confirm", "review:resolve",
+]);
+const ROLE_GRANTS = {
+  viewer: _READ_ONLY,
+  operator: _OPERATOR,
+  admin: _ADMIN,
+  owner: _ADMIN,
+  // Deliberately not a subset of admin. Approving L3 legal content is not an
+  // administrative act, and an owner does not hold it either.
+  legal_approver: ["template:read", "template:approve_l3", "audit:read"],
+};
+function can(permission) {
+  const roles = cache.user?.roles || [];   // paint runs before load resolves
+  // An API-key scope may name one permission outright, and grants exactly that.
+  return roles.some(r => r === permission || (ROLE_GRANTS[r] || []).includes(permission));
+}
+
+/* ------------------------------------------------------------------- dates
+   Internally everything is UTC; every date a person here reads is Asia/Kolkata.
+   That is the same rule app/policy/engine.py follows before it checks a calling
+   window, and not a second convention: a payment received on the evening of the
+   12th IST is a 12 March fact in a notice, whichever zone the browser is in. */
+const IST = "Asia/Kolkata";
+const istDay = (iso) => {
+  const d = iso ? new Date(iso) : null;
+  return !d || isNaN(d) ? "—"
+    : d.toLocaleDateString("en-IN", { timeZone: IST, day: "2-digit", month: "short", year: "numeric" });
+};
+const istStamp = (iso) => {
+  const d = iso ? new Date(iso) : null;
+  return !d || isNaN(d) ? "—"
+    : d.toLocaleString("en-IN", { timeZone: IST, day: "2-digit", month: "short",
+                                  hour: "2-digit", minute: "2-digit" }) + " IST";
+};
+// Today in Kolkata, shaped the way <input type="date"> parses it. en-CA is
+// chosen for its ISO-ordered output, not for Canada.
+const istToday = (plusDays = 0) =>
+  new Date(Date.now() + plusDays * 86400000).toLocaleDateString("en-CA", { timeZone: IST });
+// Whole days elapsed. A duration needs no timezone; only the printed date does.
+const daysSince = (iso) => {
+  const t = Date.parse(iso || "");
+  return isNaN(t) ? null : Math.max(0, Math.floor((Date.now() - t) / 86400000));
+};
+
+/* One language list, used by both the form that creates a buyer and the form
+   that corrects one. Two lists would eventually disagree, and the buyer created
+   in Marathi would be the one that could not be corrected back to it. */
+const LANGS = [
+  ["en-IN", "English"], ["hi-IN", "Hindi"], ["ta-IN", "Tamil"], ["te-IN", "Telugu"],
+  ["kn-IN", "Kannada"], ["ml-IN", "Malayalam"], ["mr-IN", "Marathi"],
+  ["gu-IN", "Gujarati"], ["bn-IN", "Bengali"],
+];
+const langOptions = (selected) => LANGS.map(([tag, name]) =>
+  `<option value="${esc(tag)}"${tag === selected ? " selected" : ""}>${esc(name)}</option>`).join("");
+
+/* app.trade.consent.ConsentSource, exactly — a value it does not recognise comes
+   back as SOURCE_NOT_RECOGNISED. Closed here too, and for the same reason it is
+   closed there: "who told you, and how" is the first question asked when a
+   withdrawal is disputed, and free text is not evidence of anything. */
+const SOURCES = [
+  ["phone", "Said so on a call"],
+  ["dtmf", "Pressed 9 during a call"],
+  ["sms_stop", "Replied STOP to an SMS"],
+  ["email", "By email"],
+  ["letter", "By letter"],
+  ["in_person", "In person"],
+  ["portal", "Through this portal"],
+  ["webhook", "From a connected system"],
+  ["import", "From an import"],
+];
+const sourceOptions = () => SOURCES.map(([v, label]) =>
+  `<option value="${esc(v)}">${esc(label)}</option>`).join("");
+
+const CHANNELS = ["SMS", "WHATSAPP", "EMAIL", "VOICE"];
 
 let token = localStorage.getItem("crp_token");
 let current = "overview";
@@ -1054,11 +1205,6 @@ const RENDER = {
     const LADDER_LABEL = { L1: "L1 · courtesy", L2: "L2 · firm", L3: "L3 · legal" };
     const ladder = ["L1", "L2", "L3"].map(l => ({ label: LADDER_LABEL[l], value: lvl[l] ?? 0 }));
 
-    // Sentence case for readability, but L1/L2/L3 and DND stay upper — they are
-    // names, and "l3 template" reads as a typo.
-    const humanise = (r) => r.toLowerCase().replace(/_/g, " ")
-      .replace(/\b(l1|l2|l3|dnd|sms)\b/g, m => m.toUpperCase())
-      .replace(/^./, c => c.toUpperCase());
     const blocks = Object.entries(summary.block_reasons)
       .sort((a, b) => b[1] - a[1]).slice(0, 6)
       .map(([reason, n]) => ({ label: humanise(reason), value: n }));
@@ -1067,19 +1213,70 @@ const RENDER = {
     const msgRows = Object.entries(msg).map(([ch, v]) =>
       [ch, v.sent, v.delivered, v.read]);
 
+    /* One number, one source. The hero used to print
+       `summary.outstanding_display` — the sum of CreditAccount rows at status
+       OVERDUE — directly above a chart summing Invoice.outstanding_paise across
+       every collectable invoice. Two queries, two answers, one screen, and an
+       operator with no way to tell which one a debtor is about to be read.
+
+       Both are still on the payload; the chart's total wins. It is per-invoice,
+       it excludes cancelled and written-off, and it is the figure the buckets
+       underneath genuinely add up to — so the hero and the chart can no longer
+       disagree, because they are now the same number. The label moves with it:
+       this total includes invoices that are not yet due, which "overdue" would
+       have misstated. `summary` is the fallback only for a payload with no
+       report attached at all. */
+    const book = ageing.total?.display ?? summary.outstanding_display;
+    const overduePct = Math.round(
+      ((totalAged - (ageRows[0]?.value ?? 0)) / totalAged) * 100);
+
+    // The queue as the first thing on the screen. Everything below it is how
+    // the machine is doing; this is what it is waiting on a person for.
+    const queue = d.review || [];        // paint runs before load resolves
+    const waiting = r.funnel?.awaiting_human_review ?? queue.length;
+    const today = waiting > 0 ? `
+    <section>
+      <div class="card today">
+        <div class="panel-head" style="padding:0 0 4px;border:0">
+          <div><h3>Today</h3>
+            <p>${waiting} account${waiting === 1 ? "" : "s"} the ladder has stopped on
+               until somebody looks</p></div>
+          <button class="btn sm" data-go="review">Open the queue</button>
+        </div>
+        ${queue.slice(0, 4).map(it => `<div class="row">
+          <b>${esc(it.buyer_name)}</b>
+          <span class="why">${esc(reviewWhy(it))}</span>
+          <span class="amt">${esc(it.outstanding_display)}</span>
+        </div>`).join("")}
+        ${waiting > queue.slice(0, 4).length
+          ? `<p class="hint">and ${waiting - queue.slice(0, 4).length} more.</p>` : ""}
+      </div>
+    </section>` : `
+    <section>
+      <div class="card">
+        <p class="queueclear"><b>Nothing is waiting for a person.</b> Every account the
+          ladder has refused to advance has been looked at and released.</p>
+      </div>
+    </section>`;
+
     return `
+    ${today}
+
     <section>
       <div class="card" style="padding:22px 24px">
         <div class="hero">
           <div>
-            <div class="label" style="margin:0 0 2px">Outstanding, overdue</div>
-            <div class="fig">${esc(summary.outstanding_display)}</div>
+            <div class="label" style="margin:0 0 2px">Outstanding across every open invoice</div>
+            <div class="fig">${esc(book)}</div>
           </div>
           <div class="delta" style="margin-left:auto;text-align:right">
             <div><b>${esc(recovery.collected?.display ?? "₹0")}</b> collected in ${recovery.window_days ?? 90} days</div>
             <div>${recovery.accounts_settled ?? 0} account${(recovery.accounts_settled ?? 0) === 1 ? "" : "s"} settled</div>
           </div>
         </div>
+        <p class="hint">${overduePct}% of it is past due. Cancelled and written-off
+          invoices are out of this figure; invoices not yet due are in it, which is
+          what the buckets below split apart.</p>
       </div>
     </section>
 
@@ -1092,7 +1289,7 @@ const RENDER = {
           <div class="hint">Answered <em>and</em> played through. A machine answering is not a delivery.</div></div>
         <div class="card click" data-go="refusals"><div class="stat">${refused}</div>
           <div class="label">Refused, with a reason</div></div>
-        <div class="card click" data-go="ledger"><div class="stat">${review}</div>
+        <div class="card click" data-go="review"><div class="stat">${review}</div>
           <div class="label">Awaiting human review</div>
           <div class="hint">Thresholds met but never actually reached. These go to a person, not a lawyer.</div></div>
       </div>
@@ -1222,17 +1419,190 @@ const RENDER = {
     </section>`;
   },
 
+  /* ------------------------------------------------------- the review queue
+     The ladder's escape hatch, and the one view that is a to-do list. A row
+     arrives here because the machine reached a dead end no retry clears: an L3
+     rung with nothing ever delivered at L2, every number on the DND registry, a
+     dispute, or an amount that moved underneath a debt already being chased.
+     Read it as the day's work — buyer, what is owed, and the sentence saying
+     why it stopped — rather than as a log of things that went wrong. Nothing
+     here went wrong. */
+  review(d) {
+    const items = d.review || [];        // paint runs before load resolves
+    const mayResolve = can("review:resolve");
+    const mayClear = can("dispute:clear");
+
+    const rows = items.map(it => {
+      const waited = daysSince(it.last_event?.at);
+      const disputed = it.status === "IN_DISPUTE";
+      /* Resolving is refused outright while an account is in dispute — that is
+         the more specific fact and it has its own permission and its own record
+         — so the row offers the decision that is actually available rather than
+         a button whose only possible outcome is a 409. */
+      const action = disputed
+        ? (mayClear
+            ? `<button class="btn sm" data-ledger="clear_dispute"
+                 data-account="${esc(it.account_id)}" data-buyer="${esc(it.buyer_id)}"
+                 data-ref="${esc(it.invoice_ref || "")}"
+                 data-name="${esc(it.buyer_name)}">Clear dispute</button>`
+            : `<span class="noperm">Needs <code>dispute:clear</code></span>`)
+        : (mayResolve
+            ? `<button class="btn sm primary" data-resolve="${esc(it.account_id)}"
+                 data-name="${esc(it.buyer_name)}">Resolve</button>`
+            : `<span class="noperm">Needs <code>review:resolve</code></span>`);
+
+      return `<tr>
+        <td><b>${esc(it.buyer_name)}</b>${it.ever_disputed
+          ? `<div class="sub">Contested at some point</div>` : ""}</td>
+        <td>${esc(it.invoice_ref || "—")}</td>
+        <td class="num"><b>${esc(it.outstanding_display)}</b></td>
+        <td>${it.level ? pill(it.level) : "—"}</td>
+        <td class="num">${waited === null ? "—" : waited}</td>
+        <td class="wrap">${esc(reviewWhy(it))}</td>
+        <td>${action}</td></tr>`;
+    });
+
+    return `<section>
+      <h2>Waiting for a person</h2>
+      <p class="lede">Each of these is an account the ladder deliberately stopped on.
+        Resolving one records that somebody read it and hands the account back to the
+        campaign — so the note is required, and it is the only evidence afterwards
+        that the queue was worked rather than emptied.</p>
+      ${table(["Buyer","Invoice",{label:"Outstanding",num:1},"Level",
+               {label:"Days waiting",num:1},"Why it stopped",""], rows,
+              "Nothing is waiting for a person.")}
+      <p class="hint">Days waiting is counted from the event that queued the account,
+        which is the closest thing the queue reports. It is not days at the current
+        ladder level — <code>level_entered_at</code> exists on the ladder row but is
+        not returned here.</p>
+      <div id="reviewPanel"></div>
+      <div id="ledgerPanel"></div>
+    </section>`;
+  },
+
   ledger(d) {
-    const rows = (d.accounts || []).map(a => `<tr>
-      <td>${esc(a.invoice_ref || "—")}</td>
-      <td class="num"><b>${esc(a.outstanding_display)}</b></td>
-      <td class="num">${a.days_past_due}</td>
-      <td>${statusPill(a.status)}</td>
-      <td>${a.level ? pill(a.level) : "—"}</td></tr>`);
+    const accounts = d.accounts || [];
+    /* Three of these four acts address an *invoice*; only clearing a dispute
+       addresses the account. The accounts list returns `invoice_ref`, which is
+       what a person calls an invoice, and not the id that
+       POST /trade/invoices/{invoice_id}/write-off needs — so those three are
+       offered on a row that carries the id and withheld on one that does not.
+       Withheld rather than guessed: a button that posts a reference where a UUID
+       belongs is a 422 the operator reads as "nothing happened", after typing
+       the reason that was the point of the exercise. */
+    const addressable = accounts.some(a => a.invoice_id);
+    const mayCredit = can("ledger:credit");
+    const mayClose = can("ledger:write_off");
+    const mayClear = can("dispute:clear");
+    // A viewer or an operator holds none of these three, so for them the column
+    // is a header over a stack of dashes. It goes rather than sits there empty.
+    const anyActs = mayCredit || mayClose || mayClear;
+
+    const rows = accounts.map(a => {
+      const inv = a.invoice_id
+        ? ` data-invoice="${esc(a.invoice_id)}"` : "";
+      const common = ` data-account="${esc(a.id)}" data-buyer="${esc(a.buyer_id)}"` +
+        ` data-ref="${esc(a.invoice_ref || "")}"${inv}`;
+      const acts = [];
+      if (a.invoice_id && mayCredit) {
+        acts.push(`<button class="btn sm danger" data-ledger="credit_note"${common}>Credit note</button>`);
+      }
+      if (a.invoice_id && mayClose) {
+        acts.push(`<button class="btn sm danger" data-ledger="write_off"${common}>Write off</button>`);
+        acts.push(`<button class="btn sm danger" data-ledger="cancel"${common}>Cancel</button>`);
+      }
+      if (a.status === "IN_DISPUTE" && mayClear) {
+        acts.push(`<button class="btn sm" data-ledger="clear_dispute"${common}>Clear dispute</button>`);
+      }
+      return `<tr>
+        <td>${esc(a.invoice_ref || "—")}</td>
+        <td class="num"><b>${esc(a.outstanding_display)}</b></td>
+        <td class="num">${a.days_past_due}</td>
+        <td>${statusPill(a.status)}</td>
+        <td>${a.level ? pill(a.level) : "—"}</td>
+        ${anyActs
+          ? `<td><div class="acts">${acts.join("") || `<span class="noperm">—</span>`}</div></td>`
+          : ""}
+      </tr>`;
+    });
+
+    const gap = anyActs && accounts.length && !addressable ? `<div class="gapnote">
+      <b>Credit note, write-off and cancellation are not reachable from here yet.</b>
+      Each one addresses an invoice by id, and the accounts list returns
+      <code>invoice_ref</code> without <code>invoice_id</code> — so this console can
+      name the invoice to you but not to the API. <code>CreditAccount.invoice_id</code>
+      is already the column; adding it to <code>AccountOut</code> is all three
+      buttons. Clearing a dispute works today, because that addresses the account.
+    </div>` : "";
+
     return `<section><h2>Accounts</h2>
       <p class="lede">Amounts are integer paise throughout, displayed in the Indian numbering
-        system — <b>₹42,00,000</b>, never ₹4,200,000.</p>
-      ${table(["Invoice",{label:"Outstanding",num:1},{label:"Days past due",num:1},"Status","Level"], rows, "No accounts yet.")}
+        system — <b>₹42,00,000</b>, never ₹4,200,000.${anyActs
+          ? ` Everything in the last column makes a debt smaller, and every one of them
+              asks for a written reason first: each is a claim about money the debtor
+              may later dispute, and the reason is what survives to answer them.` : ""}</p>
+      ${gap}
+      ${table(["Invoice",{label:"Outstanding",num:1},{label:"Days past due",num:1},
+               "Status","Level"].concat(anyActs ? ["Actions"] : []),
+              rows, "No accounts yet.")}
+      <div id="ledgerPanel"></div>
+    </section>`;
+  },
+
+  /* -------------------------------------------------------------- payments
+     Money received, and how much of it is still sitting on account. The
+     on-account figure is the one to read: it is money already in the bank that
+     no invoice has been told about, so the ladder is still chasing a balance
+     the debtor has in fact paid down. */
+  payments(d) {
+    const rows = (d.payments || []).map(p => {
+      const id = p.id ?? p.payment_id;
+      // Two spellings of one number: the column is `unallocated_paise` and the
+      // API renders it as `on_account_*`. Whichever arrives is displayed; a
+      // figure this page has not been given is a dash, never one it computed.
+      const onAccount = p.on_account_display ?? p.unallocated_display;
+      const left = p.on_account_paise ?? p.unallocated_paise;
+      const allocatable = id && (left === undefined || left > 0);
+      return `<tr>
+        <td><b>${esc(p.reference || "—")}</b>${p.buyer_name
+          ? `<div class="sub">${esc(p.buyer_name)}</div>` : ""}</td>
+        <td class="num">${esc(p.amount_display ?? "—")}</td>
+        <td class="num">${onAccount ? `<b>${esc(onAccount)}</b>` : "—"}</td>
+        <td>${esc(istDay(p.received_date))}</td>
+        <td>${allocatable && can("buyer:write")
+          ? `<button class="btn sm" data-allocate="${esc(id)}"
+               data-label="${esc(p.reference || istDay(p.received_date))}">Allocate</button>`
+          : `<span class="noperm">${can("buyer:write") ? "Nothing on account" : "Needs <code>buyer:write</code>"}</span>`}</td>
+      </tr>`;
+    });
+
+    /* Never fetched at all, which is not the same as fetched and empty — and
+       the difference matters, because an empty table reads as "no payments",
+       which would be a lie about the ledger rather than a fact about the API.
+       Once the route exists this goes quiet on its own: a genuinely empty list
+       is `[]` and falls through to the table's own empty line. */
+    const missing = d.payments !== undefined ? "" : `<div class="gapnote">
+      <b>Nothing in the API lists payments.</b> Allocating one is wired and exact —
+      <code>POST /api/trade/payments/{payment_id}/allocate</code> — but there is no
+      read route, so this view has no payment to offer you. What it needs is
+      <code>GET /api/portal/list/payments</code> returning, per payment:
+      <code>id</code>, <code>reference</code>, <code>amount_display</code>,
+      <code>on_account_display</code> (and <code>on_account_paise</code>),
+      <code>received_date</code> and the buyer's name. Every money figure has to
+      arrive already formatted — this page does not turn paise into rupees, because
+      one place does that and it is <code>app.render.numbers</code>. Add the kind to
+      <code>portal_list</code> and add <code>payments: "payments"</code> to
+      <code>LIST_FOR</code> below, and the table fills.
+    </div>`;
+
+    return `<section><h2>Money received</h2>
+      <p class="lede">A payment is not the same as an allocation. Until it is applied to
+        an invoice it sits on account, and the invoice it should have settled keeps
+        ageing, keeps escalating and keeps being quoted at the old figure.</p>
+      ${missing}
+      ${table(["Reference",{label:"Amount",num:1},{label:"Still on account",num:1},
+               "Received",""], rows, "No payments to show.")}
+      <div id="payPanel"></div>
     </section>`;
   },
 
@@ -1255,8 +1625,14 @@ const RENDER = {
         <td class="num"><b>${esc(b.outstanding_display)}</b></td>
         <td class="num">${b.days_past_due || "—"}</td>
         <td>${b.consent_withdrawn ? pill("Withdrawn", "bad") : esc(b.language)}</td>
-        <td><button class="btn sm" data-credit="${b.id}" data-name="${esc(b.name)}">Check credit</button>
-          <button class="btn sm" data-verify="${esc(b.id)}" data-name="${esc(b.name)}">Verify</button></td>
+        <td><div class="acts">
+          <button class="btn sm" data-credit="${esc(b.id)}" data-name="${esc(b.name)}">Check credit</button>
+          <button class="btn sm" data-verify="${esc(b.id)}" data-name="${esc(b.name)}">Verify</button>
+          ${can("buyer:write") ? `<button class="btn sm" data-contact="${esc(b.id)}"
+            data-name="${esc(b.name)}" data-email="${esc(b.email || "")}"
+            data-lang="${esc(b.language || "")}"
+            data-withdrawn="${b.consent_withdrawn ? "1" : ""}">Manage</button>` : ""}
+        </div></td>
       </tr>`;
     });
 
@@ -1277,17 +1653,7 @@ const RENDER = {
           <div class="field"><label for="nbPhone2">Another number <span>optional</span></label>
             <input id="nbPhone2" placeholder="044 2851 4000" inputmode="tel"></div>
           <div class="field"><label for="nbLang">Language</label>
-            <select id="nbLang">
-              <option value="en-IN">English</option>
-              <option value="hi-IN">Hindi</option>
-              <option value="ta-IN">Tamil</option>
-              <option value="te-IN">Telugu</option>
-              <option value="kn-IN">Kannada</option>
-              <option value="ml-IN">Malayalam</option>
-              <option value="mr-IN">Marathi</option>
-              <option value="gu-IN">Gujarati</option>
-              <option value="bn-IN">Bengali</option>
-            </select></div>
+            <select id="nbLang">${langOptions("en-IN")}</select></div>
           <div class="field"><label for="nbEmail">Email <span>optional</span></label>
             <input id="nbEmail" type="email" placeholder="accounts@kumartraders.in"></div>
           <div class="field"><label for="nbRef">Your reference <span>optional</span></label>
@@ -1320,6 +1686,7 @@ const RENDER = {
               "No buyers yet. Add one above, or import a CSV.")}
       <div id="creditPanel"></div>
       <div id="verifyPanel"></div>
+      <div id="contactPanel"></div>
     </section>`;
   },
 
@@ -1450,6 +1817,10 @@ function paint({ force = false } = {}) {
   wireForms();
   wireCredit();
   wireVerify();
+  wireContact();
+  wireLedger();
+  wireReviewQueue();
+  wireAllocate();
   fitCharts();
 }
 
@@ -1665,23 +2036,17 @@ const confidencePct = (n) => {
   return Math.round(v > 1 ? v : v * 100);
 };
 
-/* The console is only ever told role names — /portal/state sends `roles`, never
-   the permission set they expand to — so this mirrors the server's own two
-   facts: a role that grants entity:confirm, or an API-key scope that names the
-   permission outright. It hides a button and grants nothing. The server refuses
-   the call regardless, which is the check that actually protects anyone; this
-   one only stops us offering an action the person cannot take. */
-const ENTITY_CONFIRM_ROLES = ["owner", "admin"];
-function canConfirmEntity() {
-  const roles = cache.user?.roles || [];   // paint runs before load resolves
-  return roles.some(r => r === "entity:confirm" || ENTITY_CONFIRM_ROLES.includes(r));
-}
+const canConfirmEntity = () => can("entity:confirm");
 
-/* Two panels can be open on this view at once, so "is a form open" is a
-   question about both — closing one must not un-pause the poll and repaint the
-   other away with someone's half-typed identity still in it. */
+/* Several panels can be open on a view at once, so "is a form open" is a
+   question about all of them — closing one must not un-pause the poll and
+   repaint another away with someone's half-typed identity still in it. Hosts
+   that belong to other views are simply absent from the DOM, and `$(id)?.` is
+   what makes that the same answer as empty. */
+const PANEL_HOSTS = ["creditPanel", "verifyPanel", "contactPanel",
+                     "ledgerPanel", "reviewPanel", "payPanel"];
 function panelsOpen() {
-  return ["creditPanel", "verifyPanel"].some(id => ($(id)?.innerHTML ?? "") !== "");
+  return PANEL_HOSTS.some(id => ($(id)?.innerHTML ?? "") !== "");
 }
 
 function verifyForm(buyerId, name) {
@@ -1951,6 +2316,661 @@ function wireReview(buyerId) {
   });
 }
 
+/* ==================================================================== acting
+   Everything from here to wireForms writes something. The shape is the one
+   wireCredit already set: a button opens a panel, the panel owns the screen
+   while it is open (formOpen), the submit posts once, and what is shown
+   afterwards is what the server sent back — never a sentence this page composed
+   about what it assumes happened.
+
+   Two rules hold throughout. Money is only ever displayed from a `_display`
+   field the server produced, and typed money is sent as typed: this page never
+   turns paise into rupees or reads a grouped number, because normalise_amount
+   and format_inr are the one place each of those happens and 4,50,000 read the
+   Western way is an order of magnitude wrong in a legal notice. And every act
+   that shrinks a debt or stops contact asks for a written reason first — the
+   operator will not remember in March why they wrote an invoice off in
+   September, and the debtor may well ask. */
+
+/* Why an account is sitting in the queue, in a sentence a non-specialist can
+   act on. The dispatcher records the block reason as its enum name, which
+   REASONS already translates; a dispute and an upstream amount change are not
+   enum names and arrive in different shapes, so each says its own piece rather
+   than being forced through one lookup and coming out as the wrong sentence. */
+function reviewWhy(item) {
+  const e = item.last_event || {};
+  if (e.event === "needs_human_review") {
+    return REASONS[e.reason] || e.detail || humanise(e.reason);
+  }
+  if (e.event === "disputed") {
+    return `Disputed — ${e.reason || item.disputed_reason || "no reason recorded"}`;
+  }
+  if (e.event === "upstream_amount_changed") {
+    return "The source system changed this invoice's amount while it was being " +
+           "chased. We may already have told this debtor a figure, so a person " +
+           "confirms it before anything further is said.";
+  }
+  if (item.status === "IN_DISPUTE") {
+    return `Disputed — ${item.disputed_reason || "no reason recorded"}`;
+  }
+  return e.event ? humanise(e.event) : "Flagged for review with no event recorded.";
+}
+
+/* -------------------------------------------------------- clearing the queue */
+function wireReviewQueue() {
+  document.querySelectorAll("[data-resolve]").forEach(btn => btn.onclick = () => {
+    const host = $("reviewPanel");
+    if (!host || !can("review:resolve")) return;
+    const accountId = btn.dataset.resolve;
+
+    formOpen = true;
+    host.innerHTML = `<div class="card addform" id="resolveCard">
+      <div class="panel-head">
+        <div><h3>Release ${esc(btn.dataset.name)} back to the ladder</h3>
+          <p>Appended to the account's history rather than replacing anything in it.</p></div>
+        <button class="btn sm" id="resolveClose">Close</button>
+      </div>
+      <form id="resolveForm">
+        <div class="formgrid">
+          <div class="field wide"><label for="rvNote">What did you find?</label>
+            <input id="rvNote" required minlength="3" maxlength="500"
+                   placeholder="Spoke to their accounts clerk; new number taken and a DND scrub requested">
+            <div class="hint">Required. An emptied queue with nothing written beside it is
+              indistinguishable from a queue somebody cleared without reading, and the
+              whole point of the flag is that a person saw the thing first.</div></div>
+        </div>
+        <div class="err" id="rvErr"></div>
+        <div class="formactions">
+          <button type="submit" class="btn primary">Resolve and release</button>
+        </div>
+        <p class="hint">This clears the review flag and nothing else. Contact does not
+          resume the moment you press it &#8212; the account goes back to the campaign,
+          which picks it up on its own cadence.</p>
+      </form>
+    </div>`;
+    host.scrollIntoView({ behavior: "smooth", block: "start" });
+    $("rvNote").focus();
+    $("resolveClose").onclick = () => { host.innerHTML = ""; formOpen = panelsOpen(); };
+
+    $("resolveForm").onsubmit = async (ev) => {
+      ev.preventDefault();
+      const err = $("rvErr"); err.textContent = "";
+      const submit = $("resolveForm").querySelector('button[type="submit"]');
+      submit.disabled = true;
+      try {
+        await api(`/trade/review-queue/${accountId}/resolve`, {
+          method: "POST",
+          body: JSON.stringify({ note: $("rvNote").value.trim() }),
+        });
+        $("resolveForm").outerHTML = `<div class="decided">Released. The account is back
+          with its campaign, and what you wrote is on its ladder history.</div>`;
+      } catch (ex) {
+        err.textContent = String(ex.message || ex);
+        submit.disabled = false;
+      }
+    };
+  });
+}
+
+/* ------------------------------------------------------- making a debt smaller
+   Four acts, one panel. Three of them address an invoice and one an account,
+   they call four different routes, and they are gated by three different
+   permissions — but each is a claim about money that a debtor may later
+   dispute, so each of them refuses to submit without a typed reason. Clearing a
+   dispute included: the server would accept a null resolution there, and the
+   operator would then be the only person who ever knew why a contested debt
+   became collectable again. */
+const LEDGER_ACTS = {
+  credit_note: {
+    perm: "ledger:credit",
+    title: "Issue a credit note",
+    lede: "A payment says money arrived and can be checked against a statement. This says nothing arrived and the debt shrank anyway.",
+    verb: "Issue the credit note",
+    danger: true,
+  },
+  write_off: {
+    perm: "ledger:write_off",
+    title: "Write this invoice off",
+    lede: "Stop expecting the money, and stop the ladder that was chasing it.",
+    verb: "Write it off",
+    danger: true,
+  },
+  cancel: {
+    perm: "ledger:write_off",
+    title: "Cancel this invoice",
+    lede: "Void an invoice that should never have stood.",
+    verb: "Cancel it",
+    danger: true,
+  },
+  clear_dispute: {
+    perm: "dispute:clear",
+    title: "Clear the dispute",
+    lede: "The moment a contested debt becomes collectable again.",
+    verb: "Clear the dispute",
+    danger: false,
+  },
+};
+
+function ledgerForm(act, ctx) {
+  const spec = LEDGER_ACTS[act];
+  const named = ctx.ref ? `invoice ${ctx.ref}` : "this account";
+  const extra = act === "credit_note" ? `
+        <div class="field"><label for="lgNumber">Credit note number</label>
+          <input id="lgNumber" required maxlength="100" placeholder="CN-2026-0031">
+          <div class="hint">Unique within your company. Sending the same number twice is
+            refused rather than credited twice.</div></div>
+        <div class="field"><label for="lgAmount">Amount</label>
+          <input id="lgAmount" inputmode="decimal" required placeholder="1,50,000">
+          <div class="hint">Read on the server in Indian grouping &#8212; <b>1,50,000</b>
+            is one lakh fifty thousand.</div></div>
+        <div class="field"><label for="lgIssue">Issue date</label>
+          <input id="lgIssue" type="date" required value="${esc(istToday())}"></div>` : "";
+
+  const clearing = act === "clear_dispute";
+  return `<div class="card addform" id="ledgerCard">
+    <div class="panel-head">
+      <div><h3>${esc(spec.title)} &#8212; ${esc(named)}</h3>
+        <p>${esc(spec.lede)}</p></div>
+      <button class="btn sm" id="ledgerClose">Close</button>
+    </div>
+    <form id="ledgerForm">
+      <div class="formgrid">
+        ${extra}
+        <div class="field wide">
+          <label for="lgReason">${clearing ? "How was it resolved?" : "Why?"}</label>
+          <input id="lgReason" required minlength="3" maxlength="500"
+                 placeholder="${clearing
+                   ? "Short delivery credited on 4 Sept; the buyer accepts the balance"
+                   : "Goods returned against DN-118; credit agreed by the branch"}">
+          <div class="hint">${clearing
+            ? "The dispute reason is cleared off the account when you do this, so what you write here is the surviving record that it was ever contested."
+            : "Required. It is the only account of this decision that survives, and it is what an audit of an abandoned debt reads first."}</div>
+        </div>
+      </div>
+      <div class="err" id="lgErr"></div>
+      <div class="formactions">
+        <button type="submit" class="btn ${spec.danger ? "danger" : "primary"}">${esc(spec.verb)}</button>
+      </div>
+    </form>
+  </div>`;
+}
+
+function wireLedger() {
+  document.querySelectorAll("[data-ledger]").forEach(btn => btn.onclick = () => {
+    const host = $("ledgerPanel");
+    const act = btn.dataset.ledger;
+    const spec = LEDGER_ACTS[act];
+    // The server refuses this as well. Checked here so a panel nobody could
+    // submit never opens and nobody types a reason into it for nothing.
+    if (!host || !spec || !can(spec.perm)) return;
+
+    const ctx = {
+      account: btn.dataset.account,
+      buyer: btn.dataset.buyer,
+      invoice: btn.dataset.invoice || null,
+      ref: btn.dataset.ref || "",
+    };
+
+    formOpen = true;
+    host.innerHTML = ledgerForm(act, ctx);
+    host.scrollIntoView({ behavior: "smooth", block: "start" });
+    $("ledgerForm").querySelector("input")?.focus();
+    $("ledgerClose").onclick = () => { host.innerHTML = ""; formOpen = panelsOpen(); };
+
+    $("ledgerForm").onsubmit = async (ev) => {
+      ev.preventDefault();
+      const err = $("lgErr"); err.textContent = "";
+      const submit = $("ledgerForm").querySelector('button[type="submit"]');
+      submit.disabled = true;
+      const reason = $("lgReason").value.trim();
+      try {
+        let said;
+        if (act === "credit_note") {
+          const done = await api("/trade/credit-notes", {
+            method: "POST",
+            body: JSON.stringify({
+              buyer_id: ctx.buyer,
+              invoice_id: ctx.invoice,
+              note_number: $("lgNumber").value.trim(),
+              amount: $("lgAmount").value.trim(),   // as typed; the server parses it
+              issue_date: $("lgIssue").value,
+              reason,
+            }),
+          });
+          said = `<b>${esc(done.amount_display)}</b> credited under
+            ${esc(done.note_number)}. ${done.invoice_outstanding_display
+              ? `That invoice now stands at
+                 <b>${esc(done.invoice_outstanding_display)}</b>
+                 (${esc(done.invoice_status ?? "—")}).`
+              : "It sits on account and has reduced nothing yet."}`;
+        } else if (act === "write_off" || act === "cancel") {
+          const done = await api(
+            `/trade/invoices/${ctx.invoice}/${act === "write_off" ? "write-off" : "cancel"}`,
+            { method: "POST", body: JSON.stringify({ reason }) });
+          said = `${esc(done.invoice_number)} is <b>${esc(done.status)}</b> and stands at
+            <b>${esc(done.outstanding_display)}</b>${done.account_status
+              ? `, with its recovery account now <b>${esc(done.account_status)}</b>` : ""}.
+            ${act === "write_off"
+              ? `A write-off stops this side pursuing the debt. It does not extinguish
+                 it and does not zero the balance — the sale happened, and the invoice
+                 stays on the buyer's statement.`
+              : `A cancellation voids the invoice outright, which is why one with money
+                 already against it is refused rather than dropped.`}`;
+        } else {
+          const done = await api(`/trade/accounts/${ctx.account}/dispute/clear`, {
+            method: "POST",
+            body: JSON.stringify({ resolution: reason }),
+          });
+          said = `The account is <b>${esc(done.status)}</b>.${done.ever_disputed
+            ? " It stays permanently marked as having been contested — that mark, not the current status, is what publication is gated on."
+            : ""} Anything else that asked for a person to look is still asking; that
+            is the review queue's answer to give.`;
+        }
+        /* The recomputed figure is the point of saying anything at all. The
+           operator has just moved a number that ends up in a demand call, and
+           the number they should read next is the one the ledger produced
+           rather than the one they typed into the box. */
+        $("ledgerForm").outerHTML = `<div class="decided">${said}</div>`;
+      } catch (ex) {
+        err.textContent = String(ex.message || ex);
+        submit.disabled = false;
+      }
+    };
+  });
+}
+
+/* -------------------------------------------------------- money on account
+   Oldest-first only, and that is a constraint rather than a simplification.
+   `allocations` is a map of invoice id to integer paise, so naming invoices by
+   hand would need both their ids and their outstanding figures from the server
+   — and a rupee figure typed here could not be used at all, because converting
+   it is exactly the parsing that lives in normalise_amount and nowhere else. */
+function wireAllocate() {
+  document.querySelectorAll("[data-allocate]").forEach(btn => btn.onclick = () => {
+    const host = $("payPanel");
+    if (!host || !can("buyer:write")) return;
+    const paymentId = btn.dataset.allocate;
+
+    formOpen = true;
+    host.innerHTML = `<div class="card addform" id="payCard">
+      <div class="panel-head">
+        <div><h3>Allocate &#8212; ${esc(btn.dataset.label)}</h3>
+          <p>Where money already in the bank should land.</p></div>
+        <button class="btn sm" id="payClose">Close</button>
+      </div>
+      <p class="hint" style="margin-top:0">This applies what is left on account to the
+        oldest open invoices first &#8212; the same rule, and the same recorded reason,
+        as the original allocation. It plans against what is genuinely left, never
+        against the payment's full amount, so pressing it twice cannot credit money
+        that arrived once.</p>
+      <div class="err" id="alErr"></div>
+      <div class="formactions">
+        <button class="btn primary" id="alRun">Apply oldest first</button>
+      </div>
+      <div id="alResult"></div>
+    </div>`;
+    host.scrollIntoView({ behavior: "smooth", block: "start" });
+    $("payClose").onclick = () => { host.innerHTML = ""; formOpen = panelsOpen(); };
+
+    $("alRun").onclick = async () => {
+      const err = $("alErr"); err.textContent = "";
+      const run = $("alRun");
+      run.disabled = true;
+      try {
+        // "{}" rather than no body: `allocations` is optional, and leaving it
+        // out is what asks for the oldest-first default.
+        const plan = await api(`/trade/payments/${paymentId}/allocate`, {
+          method: "POST", body: "{}",
+        });
+        const n = (plan.allocations || []).length;
+        $("alResult").innerHTML = `<div class="decided">
+          <b>${esc(plan.allocated_display)}</b> applied across ${n}
+          invoice${n === 1 ? "" : "s"}, leaving
+          <b>${esc(plan.on_account_display)}</b> on account.</div>`;
+        run.remove();
+      } catch (ex) {
+        err.textContent = String(ex.message || ex);
+        run.disabled = false;
+      }
+    };
+  });
+}
+
+/* ------------------------------------------- corrections, consent, cessation
+   The other direction from everything else on this screen. Nothing in this
+   panel touches a balance: a debtor who says "stop calling me" owes exactly
+   what they owed a moment before, and the panel is arranged so that the two
+   never look like one act.
+
+   The three ways of stopping are kept apart for the same reason the server
+   keeps them apart. A withdrawal is absolute and beats every other gate. A
+   suppression is a date. A channel opt-out is one channel — reading a STOP on
+   SMS as a full withdrawal silences a channel the debtor never objected to, and
+   recording a real withdrawal as one channel under-blocks, which is the
+   compliance incident. */
+function contactForm(ctx) {
+  const restorable = ctx.withdrawn && can("consent:restore");
+  return `<div class="card addform" id="contactCard" data-buyer="${esc(ctx.id)}">
+    <div class="panel-head">
+      <div><h3>${esc(ctx.name)}</h3>
+        <p>What we hold about this buyer, and what they have told us to stop doing.</p></div>
+      <button class="btn sm" id="contactClose">Close</button>
+    </div>
+
+    <form id="ctCorrect">
+      <div class="formgrid">
+        <div class="field"><label for="ctName">Name</label>
+          <input id="ctName" maxlength="200" value="${esc(ctx.name)}">
+          <div class="hint">This is the name a legal notice is addressed to.</div></div>
+        <div class="field"><label for="ctEmail">Email <span>empty clears it</span></label>
+          <input id="ctEmail" value="${esc(ctx.email)}" placeholder="accounts@example.in">
+          <div class="hint">No address is better than one that delivers a demand to a
+            stranger, so clearing it is allowed.</div></div>
+        <div class="field"><label for="ctLang">Language</label>
+          <select id="ctLang">${langOptions(ctx.language)}</select></div>
+      </div>
+      <div class="err" id="ctErr"></div>
+      <div class="formactions">
+        <button type="submit" class="btn">Save the correction</button>
+      </div>
+      <p class="hint">Only what you actually changed is sent. GSTIN and CIN are missing
+        from here deliberately &#8212; replacing an identifier is what voids a
+        verification tier, so it goes through <b>Verify</b>, which drops the profile
+        back to self-declared rather than leaving it stamped with a number nobody has
+        checked.</p>
+    </form>
+
+    <div class="subhead">Stop contacting them
+      <span>none of this moves the balance by a paisa</span></div>
+
+    ${restorable ? "" : `<form id="ctWithdraw">
+      <div class="formgrid">
+        <div class="field"><label for="cwSource">How did they tell you?</label>
+          <select id="cwSource">${sourceOptions()}</select></div>
+        <div class="field wide"><label for="cwReason">In their words</label>
+          <input id="cwReason" required maxlength="500"
+                 placeholder="Asked on the call not to be contacted again about this account">
+          <div class="hint">"Who told you, and how" is the first question asked when a
+            withdrawal is disputed.</div></div>
+      </div>
+      <div class="err" id="cwErr"></div>
+      <div class="formactions">
+        <button type="submit" class="btn danger">Record a withdrawal of consent</button>
+      </div>
+      <p class="hint">Absolute, and it beats every other gate. Recording it a second time
+        leaves the original date where it is &#8212; that first date is the one from
+        which every later contact was contact they had already refused.</p>
+    </form>`}
+
+    ${restorable ? `<form id="ctRestore">
+      <div class="formgrid">
+        <div class="field"><label for="crSource">How did they tell you?</label>
+          <select id="crSource">${sourceOptions()}</select></div>
+        <div class="field wide"><label for="crReason">In their words</label>
+          <input id="crReason" required maxlength="500"
+                 placeholder="Rang in to say the account is settled and we may call about the new order">
+        </div>
+      </div>
+      <div class="err" id="crErr"></div>
+      <div class="formactions">
+        <button type="submit" class="btn">Record that they agreed to be contacted again</button>
+      </div>
+      <p class="hint">The one act in this product that turns contact back on, which is why
+        it is admin-only. The buyer row carries current state and not history, so the
+        withdrawal date is cleared &#8212; the audit entry written from what you type
+        here becomes the only surviving evidence that a withdrawal ever happened.</p>
+    </form>` : (ctx.withdrawn ? `<p class="hint">Consent is withdrawn. Restoring it needs
+      <code>consent:restore</code>, which this sign-in does not hold.</p>` : "")}
+
+    <form id="ctSuppress">
+      <div class="formgrid">
+        <div class="field"><label for="csUntil">No contact before</label>
+          <input id="csUntil" type="date" required min="${esc(istToday(1))}"
+                 value="${esc(istToday(14))}">
+          <div class="hint">Midnight IST at the start of that day. The hold covers
+            everything up to it.</div></div>
+        <div class="field wide"><label for="csReason">Why</label>
+          <input id="csReason" required maxlength="500"
+                 placeholder="In hospital until the end of the month; son asked us to hold"></div>
+      </div>
+      <div class="err" id="csErr"></div>
+      <div class="formactions">
+        <button type="submit" class="btn">Hold contact</button>
+      </div>
+      <p class="hint">Only ever extends. A hold that already runs past your date stays
+        where it is &#8212; a promise to pay on Friday must not cut a recorded fortnight
+        of hospital leave short &#8212; so the effective date comes back and may not be
+        the one you asked for.</p>
+    </form>
+
+    <form id="ctOptOut">
+      <div class="formgrid">
+        <div class="field"><label for="coChannel">Channel</label>
+          <select id="coChannel">${CHANNELS.map(c =>
+            `<option value="${esc(c)}">${esc(c)}</option>`).join("")}</select></div>
+        <div class="field"><label for="coSource">How did they tell you?</label>
+          <select id="coSource">${sourceOptions()}</select></div>
+      </div>
+      <div class="err" id="coErr"></div>
+      <div class="formactions">
+        <button type="submit" class="btn">Opt them out of this channel</button>
+      </div>
+      <p class="hint">One channel, and only that one. A STOP on SMS says nothing about
+        the phone ringing.</p>
+    </form>
+
+    <div class="subhead">Numbers <span>retired, never deleted</span></div>
+    <div id="ctPhones"><p class="hint">Loading&#8230;</p></div>
+    <div id="ctRetireBlock" hidden>
+      <form id="ctRetire">
+        <div class="formgrid">
+          <div class="field"><label for="cpPhone">Number</label>
+            <select id="cpPhone"></select></div>
+          <div class="field wide"><label for="cpReason">Why is it no longer valid?</label>
+            <input id="cpReason" required maxlength="500"
+                   placeholder="Reassigned — answered by someone with no connection to the business"></div>
+        </div>
+        <div class="err" id="cpErr"></div>
+        <div class="formactions">
+          <button type="submit" class="btn danger">Mark the number invalid</button>
+        </div>
+        <p class="hint">The row stays. Calls point at it, and "who did we ring on 12 March,
+          and on what number" has to stay answerable afterwards.</p>
+      </form>
+    </div>
+
+    <div class="subhead">Promise to pay <span>pauses chasing until it falls due</span></div>
+    <form id="ctPromise">
+      <div class="formgrid">
+        <div class="field"><label for="cmAmount">Amount promised</label>
+          <input id="cmAmount" inputmode="decimal" required placeholder="2,50,000"></div>
+        <div class="field"><label for="cmBy">By when</label>
+          <input id="cmBy" type="date" required min="${esc(istToday())}"
+                 max="${esc(istToday(90))}"></div>
+      </div>
+      <div class="err" id="cmErr"></div>
+      <div class="formactions">
+        <button type="submit" class="btn">Record the promise</button>
+      </div>
+      <p class="hint">Recorded against the buyer. A promise more than ninety days out is
+        refused rather than becoming a way to switch the ladder off, and chasing resumes
+        a few days after the date &#8212; a cheque written on the day arrives after it.</p>
+    </form>
+  </div>`;
+}
+
+function wireContact() {
+  document.querySelectorAll("[data-contact]").forEach(btn => btn.onclick = () => {
+    const host = $("contactPanel");
+    if (!host || !can("buyer:write")) return;
+    const buyerId = btn.dataset.contact;
+    // Every await below can land after the operator has closed this panel or
+    // opened another buyer's. Same guard as the verification panel uses.
+    const stillOurs = () => $("contactCard")?.dataset.buyer === buyerId;
+
+    // What the row already knows, so the panel opens filled rather than empty;
+    // the authoritative record replaces it a moment later.
+    let base = {
+      name: btn.dataset.name || "",
+      email: btn.dataset.email || "",
+      language: btn.dataset.lang || "en-IN",
+    };
+
+    formOpen = true;
+    host.innerHTML = contactForm({
+      id: buyerId, ...base, withdrawn: btn.dataset.withdrawn === "1",
+    });
+    host.scrollIntoView({ behavior: "smooth", block: "start" });
+    $("ctName").focus();
+    $("contactClose").onclick = () => { host.innerHTML = ""; formOpen = panelsOpen(); };
+
+    /* Phone ids live only on the buyer record — the list the table is drawn
+       from carries the number and its DND status but not the id that
+       POST /trade/phones/{id}/retire needs. */
+    api(`/trade/buyers/${buyerId}`).then(b => {
+      if (!stillOurs()) return;
+      base = { name: b.name ?? "", email: b.email ?? "", language: b.language ?? "" };
+      $("ctName").value = base.name;
+      $("ctEmail").value = base.email;
+      if (base.language) $("ctLang").value = base.language;
+
+      const phones = b.phones || [];
+      const dndKind = (s) => s === "CLEAR" ? "ok" : s === "REGISTERED" ? "bad" : "warn";
+      $("ctPhones").innerHTML = phones.length
+        ? `<div class="scroll"><table>
+             <thead><tr><th>Number</th><th>DND</th><th>Usable</th></tr></thead>
+             <tbody>${phones.map(p => `<tr>
+               <td>${esc(p.e164)}</td>
+               <td>${pill(p.dnd_status, dndKind(p.dnd_status))}</td>
+               <td>${yn(p.is_valid)}</td></tr>`).join("")}</tbody></table></div>`
+        : `<p class="hint">No number on file, so nothing can be dialled at all.</p>`;
+
+      const usable = phones.filter(p => p.is_valid);
+      $("ctRetireBlock").hidden = !usable.length;
+      $("cpPhone").innerHTML = usable.map(p =>
+        `<option value="${esc(p.id)}">${esc(p.e164)}</option>`).join("");
+    }).catch(() => {
+      if (stillOurs()) $("ctPhones").innerHTML =
+        `<p class="hint">Could not read this buyer's numbers.</p>`;
+    });
+
+    /* One submit wrapper. Each form differs only in which error line it writes
+       to, what it posts and what it says afterwards, and four hand-rolled
+       copies of the disable-post-report dance is four places for one of them to
+       forget to re-enable its button. */
+    const on = (formId, errId, run) => {
+      const form = $(formId);
+      if (!form) return;
+      form.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const err = $(errId);
+        err.textContent = ""; err.style.color = "";
+        const submit = form.querySelector('button[type="submit"]');
+        submit.disabled = true;
+        try {
+          const said = await run();
+          if (!stillOurs()) return;
+          err.textContent = said;
+          err.style.color = "var(--green-700)";
+        } catch (ex) {
+          err.textContent = String(ex.message || ex);
+        } finally {
+          submit.disabled = false;
+        }
+      };
+    };
+
+    /* `changed: false` is not a failure. A resubmitted correction moved nothing
+       and records nothing; a second withdrawal letter moved nothing and is
+       still a real instruction on a real date, which is why the server writes an
+       audit row for it either way. Both are worth saying out loud. */
+    const settled = (change) => change.changed
+      ? change.detail
+      : `${change.detail} — the stored state already stood that way.`;
+
+    on("ctCorrect", "ctErr", async () => {
+      const patch = {};
+      const name = $("ctName").value.trim();
+      const email = $("ctEmail").value.trim();
+      const language = $("ctLang").value;
+      // Absent and null are different requests: a field left out is untouched,
+      // `email: null` clears the address. Sending all three every time would
+      // quietly clear an address every time somebody fixed a spelling.
+      if (name !== (base.name || "")) patch.name = name;
+      if (email !== (base.email || "")) patch.email = email || null;
+      if (language !== (base.language || "")) patch.language = language;
+      if (!Object.keys(patch).length) {
+        throw new Error("Nothing has changed here, so there is nothing to record.");
+      }
+      const saved = await api(`/trade/buyers/${buyerId}`, {
+        method: "PATCH", body: JSON.stringify(patch),
+      });
+      base = { name: saved.name ?? "", email: saved.email ?? "", language: saved.language ?? "" };
+      return `Corrected, and the old values are on the audit trail.`;
+    });
+
+    on("ctWithdraw", "cwErr", async () => settled(
+      await api(`/trade/buyers/${buyerId}/consent/withdraw`, {
+        method: "POST",
+        body: JSON.stringify({
+          reason: $("cwReason").value.trim(), source: $("cwSource").value,
+        }),
+      })));
+
+    on("ctRestore", "crErr", async () => settled(
+      await api(`/trade/buyers/${buyerId}/consent/restore`, {
+        method: "POST",
+        body: JSON.stringify({
+          reason: $("crReason").value.trim(), source: $("crSource").value,
+        }),
+      })));
+
+    on("ctSuppress", "csErr", async () => settled(
+      await api(`/trade/buyers/${buyerId}/suppress`, {
+        method: "POST",
+        body: JSON.stringify({
+          // The offset is not decoration. A naive timestamp here is a guess
+          // between UTC and IST, and the guess is worth five and a half hours
+          // of contact in one direction or the other — the server refuses one.
+          until: `${$("csUntil").value}T00:00:00+05:30`,
+          reason: $("csReason").value.trim(),
+        }),
+      })));
+
+    on("ctOptOut", "coErr", async () => settled(
+      await api(`/trade/buyers/${buyerId}/channel-optout`, {
+        method: "POST",
+        body: JSON.stringify({
+          channel: $("coChannel").value, source: $("coSource").value,
+        }),
+      })));
+
+    on("ctRetire", "cpErr", async () => {
+      const change = await api(`/trade/phones/${$("cpPhone").value}/retire`, {
+        method: "POST", body: JSON.stringify({ reason: $("cpReason").value.trim() }),
+      });
+      const opt = $("cpPhone").selectedOptions[0];
+      if (opt) opt.remove();
+      $("ctRetireBlock").hidden = !$("cpPhone").options.length;
+      return settled(change);
+    });
+
+    on("ctPromise", "cmErr", async () => {
+      const promise = await api("/trade/promises", {
+        method: "POST",
+        body: JSON.stringify({
+          buyer_id: buyerId,
+          amount: $("cmAmount").value.trim(),   // as typed; the server parses it
+          promised_by_date: $("cmBy").value,
+        }),
+      });
+      return `${promise.promised_amount_display} promised by ` +
+             `${istDay(promise.promised_by_date)}. Chasing resumes ` +
+             `${istStamp(promise.chase_resumes_at)}.`;
+    });
+  });
+}
+
 /* ------------------------------------------------------------------- forms
    Both forms below are re-created by every repaint, so handlers are attached
    here rather than once at startup. The live poll is paused while a form is
@@ -2039,6 +3059,10 @@ function wireForms() {
    `/portal/state` carries an ETag, so a poll that finds nothing changed is a
    304 with no body and no aggregate queries. Between scheduler ticks that is
    the common case. */
+/* `payments` has no entry, deliberately. `portal_list` serves calls, messages,
+   accounts and buyers; a fifth kind here would be a 404 every fifteen seconds
+   for a table the server cannot fill either way. When the route exists, adding
+   `payments: "payments"` is the whole change on this side. */
 const LIST_FOR = { calls: "calls", messages: "messages", ledger: "accounts", buyers: "buyers" };
 let stateEtag = null;
 
@@ -2056,13 +3080,27 @@ async function fetchState() {
   return res.json();
 }
 
+/* The review queue is its own route rather than a `portal_list` kind, and it is
+   wanted on two views: in full on Review, and as the four names in the Today
+   panel. The Overview takes five rows because the *count* beside them comes
+   free from the funnel report already in portal state — so the queue costs one
+   small query there, not a hundred rows every fifteen seconds. */
+const REVIEW_LIMIT = { review: 100, overview: 5 };
+
 async function load({ listOnly = false } = {}) {
   const kind = LIST_FOR[current];
-  const [state, rows] = await Promise.all([
+  const reviewLimit = REVIEW_LIMIT[current];
+  const [state, rows, queue] = await Promise.all([
     listOnly ? Promise.resolve(null) : fetchState().catch(() => null),
     // Only the open view's rows. The Overview shows none of them, so on that
     // view this is skipped entirely.
-    kind ? api(`/portal/list/${kind}?limit=50`).catch(() => []) : Promise.resolve(null),
+    // `null` on failure, not `[]`: an empty array is truthy and would overwrite
+    // a good cache with nothing, blanking the table the operator is reading
+    // because one poll happened to fail.
+    kind ? api(`/portal/list/${kind}?limit=50`).catch(() => null) : Promise.resolve(null),
+    reviewLimit
+      ? api(`/trade/review-queue?limit=${reviewLimit}`).catch(() => null)
+      : Promise.resolve(null),
   ]);
 
   if (state) {
@@ -2076,6 +3114,7 @@ async function load({ listOnly = false } = {}) {
     if (el) el.textContent = state.company.name;
   }
   if (kind && rows) cache[kind] = rows;
+  if (queue) cache.review = queue;
 
   // The profile is its own endpoint rather than part of portal state: it is
   // read on one screen and changes about once a year, so it has no business

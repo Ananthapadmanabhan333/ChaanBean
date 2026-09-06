@@ -21,30 +21,60 @@ from fastapi import (
     status,
 )
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.schemas import (
     AccountOut,
+    AllocationOut,
+    AuditEntryOut,
+    AllocationPlanOut,
+    BehaviourOut,
+    BlackoutDateIn,
+    BlackoutDateOut,
     BuyerIdentityIn,
     BuyerIdentityOut,
     BuyerIn,
     BuyerOut,
+    BuyerPatchIn,
     CallerIdOut,
+    CaseSearchOut,
+    ChannelOptOutIn,
+    ConsentIn,
+    ContactChangeOut,
     CreditCheckIn,
     CreditCheckOut,
     CreditDecisionIn,
+    CreditNoteIn,
+    CreditNoteOut,
     CompanyProfileIn,
     CompanyProfileOut,
+    DisputeClearIn,
     EntityCandidateReviewIn,
+    InvoiceClosureIn,
+    InvoiceOut,
+    LegalLinkOut,
+    LegalLinkReviewIn,
+    OnAccountIn,
     PhoneIn,
+    PhoneRetireIn,
+    PrelegalIn,
+    PrelegalOut,
+    PromiseIn,
+    PromiseOut,
+    PromiseSettleIn,
     CallOut,
     CampaignIn,
     CampaignOut,
+    CampaignPatchIn,
     ImportPreviewOut,
     InvoiceIn,
     LoginRequest,
     MessageOut,
     PaymentIn,
+    ReviewItemOut,
+    ReviewResolveIn,
+    SuppressIn,
     TemplateIn,
     TokenResponse,
     VerificationOut,
@@ -69,12 +99,17 @@ from app.ingestion import csv_import
 from app.ingestion.normalise import NormalisationError, normalise_amount, normalise_phone
 from app.models import (
     AccountStatus,
+    AuditLog,
+    BlackoutDate,
     Buyer,
     BuyerPhone,
     CallerId,
+    Channel,
     Company,
     CompanyProfile,
+    CourtCase,
     CreditAssessment,
+    CreditNote,
     Call,
     CallStatus,
     Campaign,
@@ -87,10 +122,12 @@ from app.models import (
     ImportBatch,
     Invoice,
     InvoiceStatus,
+    LegalLink,
     Message,
     MessageTemplate,
     Payment,
     PaymentBehaviour,
+    Promise,
     TemplateVersion,
     User,
     VerificationReport,
@@ -98,9 +135,14 @@ from app.models import (
 from app.providers.base import REGISTRY
 from app.render.numbers import format_inr
 from app.scheduler import campaign as campaign_ops
-from app.trade import accounts as account_ops
+from app.trade import (
+    CLOSED_ACCOUNT_STATUSES,
+    accounts as account_ops,
+    consent as consent_ops,
+    reduction,
+)
 from app.trade.ageing import buyer_position, days_past_due
-from app.trade.allocation import apply_payment
+from app.trade.allocation import AllocationError, apply_payment
 
 router = APIRouter(prefix="/api")
 
@@ -495,6 +537,7 @@ def _account_out(session: Session, account: CreditAccount, now: datetime) -> Acc
     return AccountOut(
         id=account.id,
         buyer_id=account.buyer_id,
+        invoice_id=account.invoice_id,
         invoice_ref=account.invoice_ref,
         outstanding_paise=account.outstanding_paise,
         outstanding_display=format_inr(account.outstanding_paise),
@@ -1058,11 +1101,14 @@ def _ledger_facts(session: Session, buyer_id: UUID, now: datetime):
         )
     ).scalar_one()
 
+    # Closed, not merely settled. A written-off account keeps the balance that
+    # is genuinely still owed, so excluding SETTLED alone would score a debt this
+    # side abandoned as currently overdue against the buyer.
     open_rows = list(
         session.execute(
             select(CreditAccount).where(
                 CreditAccount.buyer_id == buyer_id,
-                CreditAccount.status != AccountStatus.SETTLED,
+                CreditAccount.status.notin_(CLOSED_ACCOUNT_STATUSES),
             )
         ).scalars()
     )
@@ -1470,7 +1516,15 @@ def record_payment(
     session: Session = Depends(tenant_db),
     principal: Principal = Depends(require(Permission.BUYER_WRITE)),
 ):
-    """Recording a payment settles accounts and stops their ladders immediately."""
+    """Recording a payment settles accounts and stops their ladders immediately.
+
+    A resubmitted form, a retried request and an ERP replaying a webhook all
+    arrive here as a second identical payment, and until there was an index to
+    catch it each one allocated a second time — telling the debtor they owed
+    less than they do, and eventually that they were in credit. The 409 below is
+    the index speaking; the caller can send the same reference all day and only
+    the first one moves the ledger.
+    """
     payment = Payment(
         company_id=principal.company_id,
         buyer_id=body.buyer_id,
@@ -1480,20 +1534,55 @@ def record_payment(
         reference=body.reference,
     )
     session.add(payment)
-    session.flush()
-    plan = apply_payment(session, payment, instructions=body.allocations)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"a payment referenced {body.reference!r} is already recorded for this "
+            f"buyer. If this is a genuinely separate receipt it needs its own "
+            f"reference; allocating the same one twice would credit money that "
+            f"arrived once.",
+        )
+    try:
+        plan = apply_payment(session, payment, instructions=body.allocations)
+    except AllocationError as exc:
+        session.rollback()
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
 
     for allocation in plan.allocations:
         account_ops.sync_account_from_invoice(
             session, session.get(Invoice, allocation.invoice_id)
         )
+    audit.record_for(
+        session,
+        principal,
+        action="ledger.payment_recorded",
+        entity_type="payment",
+        entity_id=payment.id,
+        after={
+            "buyer_id": str(payment.buyer_id),
+            "amount_paise": payment.amount_paise,
+            "reference": payment.reference,
+            "allocated_paise": plan.allocated_paise,
+            "on_account_paise": plan.unallocated_paise,
+        },
+    )
     session.commit()
     return {
         "payment_id": payment.id,
         "allocated_paise": plan.allocated_paise,
+        "allocated_display": format_inr(plan.allocated_paise),
         "on_account_paise": plan.unallocated_paise,
+        "on_account_display": format_inr(plan.unallocated_paise),
         "allocations": [
-            {"invoice_id": a.invoice_id, "amount_paise": a.amount_paise, "rule": a.rule.value}
+            {
+                "invoice_id": a.invoice_id,
+                "amount_paise": a.amount_paise,
+                "amount_display": format_inr(a.amount_paise),
+                "rule": a.rule.value,
+            }
             for a in plan.allocations
         ],
     }
@@ -1516,6 +1605,1314 @@ def raise_dispute(
     )
     session.commit()
     return {"status": account.status.value}
+
+
+# --------------------------------------------------------- making a debt smaller
+#
+# Every write path above this line can only grow what a buyer owes. That
+# asymmetry is what these routes close, and it is why they are separately
+# permissioned: a balance nobody can reduce keeps generating dunning calls,
+# assessments and notice figures long after the reason for them has gone, and a
+# balance anybody can reduce is a debt that quietly disappears.
+#
+# None of them assigns `outstanding_paise`. Each calls into `app.trade.reduction`,
+# which ends at the single writer, and each returns the recomputed balance —
+# because the caller has just changed a number that ends up in a legal notice,
+# and the number they should read next is the one the ledger produced.
+
+
+def _invoice_out(session: Session, invoice: Invoice) -> InvoiceOut:
+    account = account_ops.account_for_invoice(session, invoice.id)
+    return InvoiceOut(
+        id=invoice.id,
+        buyer_id=invoice.buyer_id,
+        invoice_number=invoice.invoice_number,
+        status=invoice.status.value,
+        net_paise=invoice.net_paise,
+        net_display=format_inr(invoice.net_paise),
+        outstanding_paise=invoice.outstanding_paise,
+        outstanding_display=format_inr(invoice.outstanding_paise),
+        closure_reason=invoice.closure_reason,
+        closed_at=invoice.closed_at,
+        account_status=account.status.value if account is not None else None,
+    )
+
+
+def _require_named_user(principal: Principal, act: str) -> None:
+    """Refuse an API key on a decision that has to be somebody's.
+
+    An API key scoped to one of the admin permissions clears `require(...)`
+    carrying no user id, and the decision is then filed as nobody's — written
+    into `invoices.closed_by` as NULL, which is the column that exists to answer
+    "who decided that". A permission gate answers whether the act is allowed; it
+    cannot answer who performed it, and for these six that second answer is the
+    point of the gate.
+    """
+    if principal.user_id is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"{act} needs a named user; an API key cannot be the person who "
+            f"signed off on it",
+        )
+
+
+def _refuse_reduction(session: Session, exc: reduction.ReductionError) -> HTTPException:
+    """Turn a named ledger refusal into a 409 that quotes it.
+
+    The refusal member travels in the body as well as the sentence: a caller
+    branching on `INVOICE_HAS_SETTLEMENTS` should not have to match on English.
+    """
+    session.rollback()
+    return HTTPException(
+        status.HTTP_409_CONFLICT, f"{exc.refusal.value}: {exc.detail}"
+    )
+
+
+@trade_router.post("/credit-notes", response_model=CreditNoteOut, status_code=201)
+def issue_credit_note(
+    body: CreditNoteIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.LEDGER_CREDIT)),
+):
+    """Issue a credit note, and bring the recovery projection with it.
+
+    Not `BUYER_WRITE`, unlike recording a payment. A payment asserts money
+    arrived and can be checked against a bank statement; a credit note asserts
+    nothing arrived and the debt shrank anyway. See `Permission.LEDGER_CREDIT`.
+
+    The note is added to the session before it is applied because the
+    over-credit guard works by summing `credit_notes` rows: an unsaved note is
+    invisible to it, and the credit would land unchecked.
+    """
+    amount_paise = _money(body.amount, "credit note amount")
+    if amount_paise <= 0:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "a credit note must be for more than zero",
+        )
+
+    buyer = session.get(Buyer, body.buyer_id)
+    if buyer is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such buyer")
+
+    invoice = None
+    if body.invoice_id is not None:
+        invoice = session.get(Invoice, body.invoice_id)
+        if invoice is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such invoice")
+        if invoice.buyer_id != buyer.id:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"invoice {invoice.invoice_number} belongs to a different buyer; "
+                f"crediting it here would reduce a debt this note has nothing to "
+                f"do with",
+            )
+
+    now = datetime.now(timezone.utc)
+    note = CreditNote(
+        company_id=principal.company_id,
+        buyer_id=buyer.id,
+        invoice_id=invoice.id if invoice is not None else None,
+        note_number=body.note_number,
+        amount_paise=amount_paise,
+        issue_date=body.issue_date,
+        reason=body.reason,
+    )
+    session.add(note)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"credit note {body.note_number!r} already exists in this company",
+        )
+
+    try:
+        reduction.apply_credit_note(session, note, now=now)
+    except reduction.ReductionError as exc:
+        raise _refuse_reduction(session, exc)
+    except AllocationError as exc:
+        # The over-credit refusal, which names the excess in paise. It stays
+        # `app.trade.allocation`'s sentence rather than being rephrased here.
+        session.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+
+    audit.record_for(
+        session,
+        principal,
+        action="ledger.credit_note_issued",
+        entity_type="credit_note",
+        entity_id=note.id,
+        after={
+            "buyer_id": str(note.buyer_id),
+            "invoice_id": str(note.invoice_id) if note.invoice_id else None,
+            "note_number": note.note_number,
+            "amount_paise": note.amount_paise,
+            "reason": note.reason,
+        },
+    )
+    session.commit()
+    session.refresh(note)
+    if invoice is not None:
+        session.refresh(invoice)
+    return CreditNoteOut(
+        id=note.id,
+        buyer_id=note.buyer_id,
+        invoice_id=note.invoice_id,
+        note_number=note.note_number,
+        amount_paise=note.amount_paise,
+        amount_display=format_inr(note.amount_paise),
+        issue_date=note.issue_date,
+        reason=note.reason,
+        invoice_outstanding_paise=invoice.outstanding_paise if invoice else None,
+        invoice_outstanding_display=(
+            format_inr(invoice.outstanding_paise) if invoice else None
+        ),
+        invoice_status=invoice.status.value if invoice else None,
+    )
+
+
+@trade_router.post("/payments/{payment_id}/allocate", response_model=AllocationPlanOut)
+def allocate_on_account(
+    payment_id: UUID,
+    body: OnAccountIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+):
+    """Apply money already received to the invoices named.
+
+    `BUYER_WRITE` deliberately, and not one of the new ledger permissions: the
+    money is already recorded, nothing about the total moves, and deciding which
+    invoice it lands against is something the same permission already does at
+    the moment of receipt through `allocations` on `POST /trade/payments`.
+
+    What this must never become is a second `apply_payment`. That plans against
+    the payment's full amount and would allocate the whole sum a second time;
+    `reduction.apply_on_account` plans against what is genuinely left.
+    """
+    payment = session.get(Payment, payment_id)
+    if payment is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such payment")
+
+    before_unallocated = payment.unallocated_paise
+    try:
+        plan = reduction.apply_on_account(
+            session, payment, instructions=body.allocations
+        )
+    except reduction.ReductionError as exc:
+        raise _refuse_reduction(session, exc)
+    except AllocationError as exc:
+        session.rollback()
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+
+    audit.record_for(
+        session,
+        principal,
+        action="ledger.on_account_allocated",
+        entity_type="payment",
+        entity_id=payment.id,
+        before={"unallocated_paise": before_unallocated},
+        after={
+            "unallocated_paise": plan.unallocated_paise,
+            "allocations": [
+                {"invoice_id": str(a.invoice_id), "amount_paise": a.amount_paise}
+                for a in plan.allocations
+            ],
+        },
+    )
+    session.commit()
+    return AllocationPlanOut(
+        payment_id=payment.id,
+        allocated_paise=plan.allocated_paise,
+        allocated_display=format_inr(plan.allocated_paise),
+        on_account_paise=plan.unallocated_paise,
+        on_account_display=format_inr(plan.unallocated_paise),
+        allocations=[
+            AllocationOut(
+                invoice_id=a.invoice_id,
+                amount_paise=a.amount_paise,
+                amount_display=format_inr(a.amount_paise),
+                rule=a.rule.value,
+            )
+            for a in plan.allocations
+        ],
+    )
+
+
+def _close_invoice(
+    session: Session,
+    principal: Principal,
+    invoice: Invoice,
+    *,
+    reason: str,
+    action: str,
+    close,
+) -> InvoiceOut:
+    """Shared body of write-off and cancellation.
+
+    The two differ only in which `reduction` function runs and what the act is
+    called; everything around it — the refusal, the closure columns, the audit
+    row — is the same, and duplicating it is how the two drift.
+
+    `closure_reason` and its companions are written here rather than inside
+    `reduction`, which takes the reason as an argument and puts it on the ladder
+    history. That history is durable but it is JSONB on the recovery projection,
+    and it is skipped entirely when the account has no escalation row; the
+    columns are where the reason stays queryable and exportable.
+    """
+    _require_named_user(principal, "abandoning a debt")
+
+    now = datetime.now(timezone.utc)
+    before = {
+        "status": invoice.status.value,
+        "outstanding_paise": invoice.outstanding_paise,
+    }
+    try:
+        close(session, invoice, reason=reason, now=now)
+    except reduction.ReductionError as exc:
+        raise _refuse_reduction(session, exc)
+    except AllocationError as exc:
+        # `ReductionError` is a subclass, so the clause above does not catch the
+        # parent. Both closing paths reach `recompute_invoice`, which raises the
+        # bare error on an over-settled invoice — and that has to arrive as the
+        # named refusal the sibling ledger routes give, not a 500 over a dirty
+        # session.
+        session.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+
+    invoice.closure_reason = reason
+    invoice.closed_by = principal.user_id
+    invoice.closed_at = now
+
+    account = account_ops.account_for_invoice(session, invoice.id)
+    audit.record_for(
+        session,
+        principal,
+        action=action,
+        entity_type="invoice",
+        entity_id=invoice.id,
+        before=before,
+        after={
+            "status": invoice.status.value,
+            "outstanding_paise": invoice.outstanding_paise,
+            "reason": reason,
+            "account_status": account.status.value if account is not None else None,
+        },
+    )
+    session.commit()
+    session.refresh(invoice)
+    return _invoice_out(session, invoice)
+
+
+@trade_router.post("/invoices/{invoice_id}/write-off", response_model=InvoiceOut)
+def write_off_invoice(
+    invoice_id: UUID,
+    body: InvoiceClosureIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.LEDGER_WRITE_OFF)),
+):
+    """Stop expecting the money. The ladder stops with it.
+
+    A write-off does not extinguish the debt and does not zero the balance: the
+    sale happened, the buyer's books still carry the payable, and the invoice
+    stays on their statement. What changes is that this side stops pursuing it,
+    which is why the account status in the response is the part worth reading.
+    """
+    invoice = session.get(Invoice, invoice_id)
+    if invoice is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such invoice")
+    return _close_invoice(
+        session,
+        principal,
+        invoice,
+        reason=body.reason,
+        action="ledger.invoice_written_off",
+        close=reduction.write_off,
+    )
+
+
+@trade_router.post("/invoices/{invoice_id}/cancel", response_model=InvoiceOut)
+def cancel_invoice(
+    invoice_id: UUID,
+    body: InvoiceClosureIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.LEDGER_WRITE_OFF)),
+):
+    """Void an invoice that should never have stood.
+
+    The 409 to expect is `INVOICE_HAS_SETTLEMENTS`. Dropping the debit while the
+    payment against it stays as a credit reads, on a statement already sent, as
+    though the buyer had overpaid — so an invoice with money against it is
+    written off instead, or the payment is reversed first.
+    """
+    invoice = session.get(Invoice, invoice_id)
+    if invoice is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such invoice")
+    return _close_invoice(
+        session,
+        principal,
+        invoice,
+        reason=body.reason,
+        action="ledger.invoice_cancelled",
+        close=reduction.cancel_invoice,
+    )
+
+
+@trade_router.post("/accounts/{account_id}/dispute/clear")
+def clear_account_dispute(
+    account_id: UUID,
+    body: DisputeClearIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.DISPUTE_CLEAR)),
+):
+    """Lift a dispute, leaving evidence that there was one.
+
+    Admin-only, and this is the route the permission was minted for: clearing a
+    dispute is the moment a contested debt becomes collectable again, and the
+    ladder entry it appends is the only surviving record that the debt was ever
+    contested — which is what `app.registry.eligibility` gates publication on.
+
+    Two things it deliberately does not do. It does not clear
+    `needs_human_review`: whatever else asked for a person to look is still
+    asking, and the review queue is where that is answered. And it does not
+    resume contact by itself — the account returns to OVERDUE and the scheduler
+    picks it up on its own cadence.
+    """
+    _require_named_user(principal, "declaring a dispute resolved")
+
+    account = session.get(CreditAccount, account_id)
+    if account is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "account not found")
+    if account.status is not AccountStatus.IN_DISPUTE:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"this account is {account.status.value}, not in dispute; there is "
+            f"nothing to clear",
+        )
+
+    before = {
+        "status": account.status.value,
+        "disputed_reason": account.disputed_reason,
+    }
+    account_ops.clear_dispute(session, account, resolution=body.resolution)
+    audit.record_for(
+        session,
+        principal,
+        action=audit.Action.ACCOUNT_STATUS_CHANGED,
+        entity_type="credit_account",
+        entity_id=account_id,
+        before=before,
+        after={
+            "status": account.status.value,
+            "resolution": body.resolution,
+            "ever_disputed": True,
+        },
+    )
+    session.commit()
+    return {
+        "status": account.status.value,
+        # Stated in the response because it is the surprising half: the dispute
+        # is over and the account is still permanently marked as having been
+        # contested.
+        "ever_disputed": account_ops.ever_disputed(session, account),
+    }
+
+
+# ------------------------------------------- corrections, consent and cessation
+#
+# The other direction from everything else here: the debtor saying "that is not
+# my name" or "stop calling me". Each of these routes writes the audit row from
+# what the service returns, because the service deliberately writes none — it
+# has no way to know who asked, and a `restore_consent` with no audit row behind
+# it silently erases that a withdrawal ever happened.
+
+
+def _refuse_consent(session: Session, exc: consent_ops.ConsentError) -> HTTPException:
+    session.rollback()
+    return HTTPException(
+        status.HTTP_422_UNPROCESSABLE_ENTITY, f"{exc.refusal.value}: {exc.detail}"
+    )
+
+
+def _change_out(change: consent_ops.ContactChange) -> ContactChangeOut:
+    return ContactChangeOut(
+        entity_type=change.entity_type,
+        entity_id=change.entity_id,
+        before=change.before,
+        after=change.after,
+        detail=change.detail,
+        changed=change.changed,
+    )
+
+
+def _record_change(
+    session: Session,
+    principal: Principal,
+    change: consent_ops.ContactChange,
+    *,
+    action: str,
+) -> ContactChangeOut:
+    """Write the audit row, whether or not the row moved.
+
+    Unlike a correction, which records nothing when a resubmitted form changes
+    nothing: a second withdrawal letter is a real instruction from a real person
+    on a real date, and "they told us again and we have it in writing" is
+    precisely what gets asked for when a withdrawal is disputed. `changed` in
+    the response says the stored state stayed put.
+    """
+    audit.record_for(
+        session,
+        principal,
+        action=action,
+        entity_type=change.entity_type,
+        entity_id=change.entity_id,
+        before=change.before,
+        after=change.after,
+        detail=change.detail,
+    )
+    session.commit()
+    return _change_out(change)
+
+
+def _buyer_or_404(session: Session, buyer_id: UUID) -> Buyer:
+    buyer = session.get(Buyer, buyer_id)
+    if buyer is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such buyer")
+    return buyer
+
+
+@trade_router.patch("/buyers/{buyer_id}", response_model=BuyerOut)
+def correct_buyer(
+    buyer_id: UUID,
+    body: BuyerPatchIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+):
+    """Correct name, email or language. Nothing else is correctable here.
+
+    The declared GSTIN and CIN are absent from the whitelist on purpose: editing
+    them is what voids a verification tier, and that goes through
+    `PUT /trade/buyers/{id}/identity`, which resets the profile to
+    self-declared. Written here they would leave a row still stamped IDENTIFIER
+    while carrying a number nobody has checked — and that stamp is what a notice
+    is issued against.
+    """
+    buyer = _buyer_or_404(session, buyer_id)
+    # `exclude_unset` is what separates "leave the email alone" from "clear it".
+    # Both are legitimate, and a model_dump without it would silently do the
+    # second every time somebody edited a name.
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "no correctable field was sent"
+        )
+
+    try:
+        before, after = consent_ops.correct_buyer(session, buyer, fields=fields)
+    except consent_ops.ConsentError as exc:
+        raise _refuse_consent(session, exc)
+
+    # No audit row when nothing moved. A resubmitted form is not a write, and an
+    # entry recording that a name stayed the same is noise in the one trail that
+    # has to stay readable.
+    if after:
+        audit.record_for(
+            session,
+            principal,
+            action="buyer.corrected",
+            entity_type="buyer",
+            entity_id=buyer.id,
+            before=before,
+            after=after,
+        )
+    session.commit()
+    session.refresh(buyer)
+    return buyer
+
+
+@trade_router.post("/buyers/{buyer_id}/consent/withdraw", response_model=ContactChangeOut)
+def withdraw_consent(
+    buyer_id: UUID,
+    body: ConsentIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+):
+    """Record that this person has told us to stop contacting them.
+
+    `BUYER_WRITE` rather than one of the privileged permissions: the operator
+    who just took the call is exactly who should be able to write this down, and
+    every effect of it reduces contact. Making it an admin act would mean a
+    withdrawal waiting in a queue while the campaign kept dialling.
+
+    It touches no balance. A debtor who says "stop calling" owes precisely what
+    they owed a moment before.
+    """
+    buyer = _buyer_or_404(session, buyer_id)
+    try:
+        change = consent_ops.record_consent_withdrawal(
+            session, buyer, reason=body.reason, source=body.source
+        )
+    except consent_ops.ConsentError as exc:
+        raise _refuse_consent(session, exc)
+    return _record_change(
+        session, principal, change, action=audit.Action.BUYER_CONSENT_CHANGED
+    )
+
+
+@trade_router.post("/buyers/{buyer_id}/consent/restore", response_model=ContactChangeOut)
+def restore_consent(
+    buyer_id: UUID,
+    body: ConsentIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.CONSENT_RESTORE)),
+):
+    """Record that the person has agreed to be contacted again.
+
+    The one act in the product that turns contact back on, hence its own
+    admin-only permission. The buyer row carries current state rather than
+    history, so this clears `consent_withdrawn_at` — which makes the audit row
+    written from `before` the only surviving evidence that a withdrawal ever
+    happened. That is why the reason and the source are required.
+    """
+    _require_named_user(principal, "turning contact back on")
+
+    buyer = _buyer_or_404(session, buyer_id)
+    try:
+        change = consent_ops.restore_consent(
+            session, buyer, reason=body.reason, source=body.source
+        )
+    except consent_ops.ConsentError as exc:
+        raise _refuse_consent(session, exc)
+    return _record_change(
+        session, principal, change, action=audit.Action.BUYER_CONSENT_CHANGED
+    )
+
+
+@trade_router.post("/buyers/{buyer_id}/suppress", response_model=ContactChangeOut)
+def suppress_buyer(
+    buyer_id: UUID,
+    body: SuppressIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+):
+    """Hold all contact until a date.
+
+    Only ever extends. A hold that already runs past `until` stays where it is,
+    so a promise to pay on Friday cannot cut a recorded fortnight of hospital
+    leave short — and the effective date comes back in `after`, which may not be
+    the one that was asked for.
+    """
+    buyer = _buyer_or_404(session, buyer_id)
+    try:
+        change = consent_ops.suppress_until(
+            session, buyer, until=body.until, reason=body.reason
+        )
+    except consent_ops.ConsentError as exc:
+        raise _refuse_consent(session, exc)
+    return _record_change(
+        session, principal, change, action=audit.Action.BUYER_SUPPRESSED
+    )
+
+
+@trade_router.post(
+    "/buyers/{buyer_id}/channel-optout", response_model=ContactChangeOut, status_code=201
+)
+def opt_out_channel(
+    buyer_id: UUID,
+    body: ChannelOptOutIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+):
+    """Suppress one channel, and only that channel.
+
+    STOP on SMS says nothing about the phone ringing. Reading it as a full
+    withdrawal silences a channel the debtor never objected to; recording a real
+    withdrawal as one channel under-blocks, and that is the compliance incident.
+    Until this route existed the engine's CHANNEL_OPTED_OUT refusal could never
+    fire, because nothing wrote the row it reads.
+    """
+    buyer = _buyer_or_404(session, buyer_id)
+    try:
+        change = consent_ops.record_channel_optout(
+            session, buyer, channel=body.channel, source=body.source
+        )
+    except consent_ops.ConsentError as exc:
+        raise _refuse_consent(session, exc)
+    return _record_change(
+        session, principal, change, action="buyer.channel_opted_out"
+    )
+
+
+@trade_router.post("/phones/{phone_id}/retire", response_model=ContactChangeOut)
+def retire_phone(
+    phone_id: UUID,
+    body: PhoneRetireIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+):
+    """Flag a number as no longer valid. Never deletes it.
+
+    Calls point at this row, and "who did we ring on 12 March, and on what
+    number" has to stay answerable afterwards. The reason has no column, which
+    is why it goes to the audit entry beside the person who decided.
+    """
+    phone = session.get(BuyerPhone, phone_id)
+    if phone is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such phone number")
+    try:
+        change = consent_ops.invalidate_phone(session, phone, reason=body.reason)
+    except consent_ops.ConsentError as exc:
+        raise _refuse_consent(session, exc)
+    return _record_change(session, principal, change, action="buyer.phone_retired")
+
+
+# --------------------------------------------------------------------- promises
+
+
+def _promise_out(promise: Promise) -> PromiseOut:
+    from app.intelligence import promises as promise_ops
+
+    return PromiseOut(
+        id=promise.id,
+        buyer_id=promise.buyer_id,
+        account_id=promise.account_id,
+        promised_amount_paise=promise.promised_amount_paise,
+        promised_amount_display=format_inr(promise.promised_amount_paise),
+        promised_on=promise.promised_on,
+        promised_by_date=promise.promised_by_date,
+        status=promise.status,
+        settled_at=promise.settled_at,
+        chase_resumes_at=promise_ops.chase_resumes_at(promise.promised_by_date),
+    )
+
+
+@trade_router.post("/promises", response_model=PromiseOut, status_code=201)
+def record_promise(
+    body: PromiseIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+):
+    """Record a promise to pay, and pause chasing until it falls due.
+
+    Operator work by design — the person taking the promise is on the call — and
+    the horizon cap is what stops that being abusable from the debtor's side: a
+    promise more than ninety days out is refused rather than becoming a way to
+    switch the ladder off.
+
+    `promised_on` defaults to today in the promise timezone rather than to UTC's
+    today. Between 18:30 and midnight IST those are different dates, and the
+    wrong one makes a same-day promise look retrospective.
+    """
+    from zoneinfo import ZoneInfo
+
+    from app.intelligence import promises as promise_ops
+
+    buyer = _buyer_or_404(session, body.buyer_id)
+    account = None
+    if body.account_id is not None:
+        account = session.get(CreditAccount, body.account_id)
+        if account is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such account")
+
+    amount_paise = _money(body.amount, "promised amount")
+    promised_on = body.promised_on or datetime.now(
+        ZoneInfo(promise_ops.PROMISE_TIMEZONE)
+    ).date()
+
+    try:
+        promise = promise_ops.record_promise(
+            session,
+            buyer=buyer,
+            promised_amount_paise=amount_paise,
+            promised_on=promised_on,
+            promised_by_date=body.promised_by_date,
+            account=account,
+            recorded_by=principal.user_id,
+        )
+    except promise_ops.PromiseRefused as exc:
+        session.rollback()
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, f"{exc.reason.value}: {exc.detail}"
+        )
+
+    audit.record_for(
+        session,
+        principal,
+        action="promise.recorded",
+        entity_type="promise",
+        entity_id=promise.id,
+        after={
+            "buyer_id": str(promise.buyer_id),
+            "account_id": str(promise.account_id) if promise.account_id else None,
+            "promised_amount_paise": promise.promised_amount_paise,
+            "promised_by_date": promise.promised_by_date.isoformat(),
+            "suppressed_until": (
+                buyer.suppressed_until.isoformat() if buyer.suppressed_until else None
+            ),
+        },
+    )
+    session.commit()
+    session.refresh(promise)
+    return _promise_out(promise)
+
+
+@trade_router.get("/buyers/{buyer_id}/promises", response_model=list[PromiseOut])
+def list_promises(
+    buyer_id: UUID,
+    session: Session = Depends(tenant_db),
+    _: Principal = Depends(require(Permission.BUYER_READ)),
+    limit: int = Query(50, le=200),
+):
+    """Newest first, broken ones included.
+
+    A kept-rate that only counted successes would report every debtor as
+    perfectly reliable right up to the day they stop answering, so BROKEN rows
+    are never removed and this never filters them out.
+    """
+    _buyer_or_404(session, buyer_id)
+    rows = session.execute(
+        select(Promise)
+        .where(Promise.buyer_id == buyer_id)
+        .order_by(Promise.promised_by_date.desc())
+        .limit(limit)
+    ).scalars()
+    return [_promise_out(p) for p in rows]
+
+
+@trade_router.post("/promises/resolve-due", response_model=list[PromiseOut])
+def resolve_due_promises(
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+):
+    """Judge every promise whose grace has run out, from the ledger.
+
+    Nothing else writes BROKEN. This belongs on a nightly sweep rather than on a
+    button — it is here so the sweep has something to call and so the state is
+    reachable at all until one exists.
+    """
+    from app.intelligence import promises as promise_ops
+
+    now = datetime.now(timezone.utc)
+    settled = promise_ops.resolve_due_promises(session, as_of=now)
+    for promise in settled:
+        audit.record_for(
+            session,
+            principal,
+            action="promise.settled",
+            entity_type="promise",
+            entity_id=promise.id,
+            after={"status": promise.status, "judged_from": "ledger"},
+        )
+    session.commit()
+    return [_promise_out(p) for p in settled]
+
+
+@trade_router.post(
+    "/promises/{promise_id}/settle", response_model=PromiseOut, status_code=200
+)
+def settle_promise(
+    promise_id: UUID,
+    body: PromiseSettleIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+):
+    """Close one promise by hand as kept or broken.
+
+    A correction to the sweep above, not a substitute for it: the sweep judges
+    from money actually received, and this exists for the case it cannot see —
+    a cheque handed over in person, a payment against a different ledger. It
+    never re-opens, and the audit row is what says a person rather than the
+    ledger decided.
+    """
+    from app.intelligence import promises as promise_ops
+
+    promise = session.get(Promise, promise_id)
+    if promise is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such promise")
+
+    try:
+        promise_ops.settle_promise(
+            session,
+            promise,
+            kept=body.kept,
+            settled_at=datetime.now(timezone.utc),
+        )
+    except promise_ops.PromiseRefused as exc:
+        session.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"{exc.reason.value}: {exc.detail}"
+        )
+
+    audit.record_for(
+        session,
+        principal,
+        action="promise.settled",
+        entity_type="promise",
+        entity_id=promise.id,
+        after={"status": promise.status, "judged_from": "operator", "note": body.note},
+    )
+    session.commit()
+    session.refresh(promise)
+    return _promise_out(promise)
+
+
+@trade_router.post("/buyers/{buyer_id}/behaviour", response_model=BehaviourOut, status_code=201)
+def roll_up_behaviour(
+    buyer_id: UUID,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+    as_of: date | None = None,
+):
+    """Append one payment-behaviour row for this buyer.
+
+    201 because every run appends: a rollup is what the ledger said on a date,
+    and `as_of` exists so a rollup for March is reconstructed from March rather
+    than stamped with today. This is the row `run_credit_check` reads for
+    mean-days-to-pay and the promise-kept rate, and until a nightly job calls
+    this, both stay absent from every score.
+    """
+    from app.intelligence import behaviour as behaviour_ops
+
+    try:
+        row = behaviour_ops.rollup_payment_behaviour(
+            session, buyer_id, as_of=as_of or datetime.now(timezone.utc).date()
+        )
+    except behaviour_ops.RollupRefused as exc:
+        # UNKNOWN_BUYER, which under RLS also covers another tenant's buyer.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, exc.detail)
+
+    audit.record_for(
+        session,
+        principal,
+        action="buyer.behaviour_rolled_up",
+        entity_type="buyer",
+        entity_id=buyer_id,
+        after={
+            "as_of": row.as_of.isoformat(),
+            "invoices_settled": row.invoices_settled,
+        },
+    )
+    session.commit()
+    session.refresh(row)
+    return BehaviourOut(
+        id=row.id,
+        buyer_id=row.buyer_id,
+        as_of=row.as_of,
+        invoices_settled=row.invoices_settled,
+        mean_days_to_pay=row.mean_days_to_pay,
+        median_days_to_pay=row.median_days_to_pay,
+        days_to_pay_trend=row.days_to_pay_trend,
+        part_payment_rate=row.part_payment_rate,
+        promise_kept_rate=row.promise_kept_rate,
+        dispute_rate=row.dispute_rate,
+    )
+
+
+# ------------------------------------------------------------- the review queue
+#
+# Accounts the machine has refused to act on until a person looks. The flag is
+# set by the dispatcher (an L3 rung with no prior delivered contact, a number on
+# the DND registry) and by a dispute being raised; without a way to see and
+# clear it, every one of those accumulates silently and the queue is a column
+# nobody reads.
+
+
+@trade_router.get("/review-queue", response_model=list[ReviewItemOut])
+def list_review_queue(
+    session: Session = Depends(tenant_db),
+    _: Principal = Depends(require(Permission.BUYER_READ)),
+    limit: int = Query(100, le=500),
+):
+    rows = session.execute(
+        select(EscalationState, CreditAccount, Buyer)
+        .join(CreditAccount, CreditAccount.id == EscalationState.account_id)
+        .join(Buyer, Buyer.id == CreditAccount.buyer_id)
+        .where(EscalationState.needs_human_review.is_(True))
+        .order_by(CreditAccount.due_date)
+        .limit(limit)
+    ).all()
+
+    out = []
+    for state, account, buyer in rows:
+        history = list(state.history or [])
+        out.append(
+            ReviewItemOut(
+                account_id=account.id,
+                buyer_id=buyer.id,
+                buyer_name=buyer.name,
+                invoice_ref=account.invoice_ref,
+                outstanding_paise=account.outstanding_paise,
+                outstanding_display=format_inr(account.outstanding_paise),
+                status=account.status.value,
+                level=state.level.value,
+                disputed_reason=account.disputed_reason,
+                ever_disputed=account_ops.ever_disputed(session, account),
+                # The last entry is what put this row here, and it is the first
+                # thing a reviewer needs — the alternative is opening each
+                # account to find out why it is waiting.
+                last_event=history[-1] if history else None,
+            )
+        )
+    return out
+
+
+@trade_router.post("/review-queue/{account_id}/resolve")
+def resolve_review(
+    account_id: UUID,
+    body: ReviewResolveIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.REVIEW_RESOLVE)),
+):
+    """Record that a person has looked, and release the account back to the ladder.
+
+    The note is required. An emptied queue with nothing written beside it is
+    indistinguishable from a queue somebody cleared without reading, and the
+    whole point of the flag is that a human saw the thing before the machine
+    resumed.
+
+    Refused while the account is still in dispute. The dispute is the more
+    specific fact and it has its own route; clearing the review flag underneath
+    one would leave the account halfway between two states, contactable
+    according to the queue and blocked according to the ledger.
+    """
+    _require_named_user(principal, "recording that a person has reviewed this")
+
+    account = session.get(CreditAccount, account_id)
+    if account is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "account not found")
+    if account.status is AccountStatus.IN_DISPUTE:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "this account is in dispute; clear the dispute first — that is a "
+            "separate decision with its own record",
+        )
+
+    # Looked up rather than created. `ensure_escalation_state` would write a
+    # ladder row for an account that has never had one, on the path where the
+    # answer is "there was nothing to resolve" — a refusal that leaves a row
+    # behind is not a refusal.
+    state = session.execute(
+        select(EscalationState).where(EscalationState.account_id == account_id)
+    ).scalar_one_or_none()
+    if state is None or not state.needs_human_review:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "this account is not waiting for a review"
+        )
+
+    now = datetime.now(timezone.utc)
+    state.needs_human_review = False
+    # Appended, never replaced. The ladder history is the durable trace of what
+    # was decided about this account and when, and it is read by `ever_disputed`.
+    state.history = list(state.history or []) + [
+        {
+            "at": now.isoformat(),
+            "event": "review_resolved",
+            "note": body.note,
+            "by": str(principal.user_id) if principal.user_id else None,
+        }
+    ]
+    audit.record_for(
+        session,
+        principal,
+        action="account.review_resolved",
+        entity_type="credit_account",
+        entity_id=account_id,
+        after={"needs_human_review": False, "note": body.note},
+    )
+    session.commit()
+    return {"account_id": str(account_id), "needs_human_review": False}
+
+
+# ------------------------------------------------------------------ court records
+#
+# Searching is desk work; deciding that a case found under a similar name is
+# this debtor's is not. The split below is the whole safety property: a search
+# proposes and counts for nothing, and only a confirmation on an identifier the
+# registry holds can reach a report or a score.
+
+
+def _court_backend():
+    """The configured court adapter, or None when courts are switched off.
+
+    A name nobody has wired is refused rather than quietly falling back to
+    `local`. The local backend returns invented filings — it is a fixture set —
+    and handing those to a route whose job is to attach litigation to a named
+    company would be defamation with our name on it.
+    """
+    from app.config import settings as cfg
+    from app.providers.courts import LocalCourtBackend, ManualCourtBackend
+
+    if cfg.court_backend == "none":
+        return None
+    if cfg.court_backend == "local":
+        return LocalCourtBackend()
+    if cfg.court_backend == "manual":
+        return ManualCourtBackend()
+    raise HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        f"court backend {cfg.court_backend!r} is named in configuration but "
+        f"nothing implements it",
+    )
+
+
+def _link_out(link: LegalLink, case: CourtCase) -> LegalLinkOut:
+    signals = link.signals or {}
+    return LegalLinkOut(
+        case_id=case.id,
+        court_id=case.court_id,
+        case_number=case.case_number,
+        case_type=case.case_type,
+        link_id=link.id,
+        status=link.status,
+        tier=signals.get("grade") or "UNKNOWN",
+        confidence=float(link.confidence or 0),
+        reasons=list(signals.get("grade_reasons") or []),
+    )
+
+
+@trade_router.post("/buyers/{buyer_id}/court-cases/search", response_model=CaseSearchOut)
+def search_court_cases(
+    buyer_id: UUID,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.COMPANY_VERIFY)),
+    filed_after: date | None = None,
+):
+    """Search the courts for this buyer and propose links for review.
+
+    `COMPANY_VERIFY` on the precedent set for registry lookups: this reads a
+    portal, records what came back, and publishes nothing on its own. Every link
+    it writes is PROPOSED, which moves no score and appears on no report.
+
+    A run that reaches a backend appends — a fresh `ProviderFetch` holding the
+    payload verbatim and a fresh `LegalHistory` recording what was claimed on
+    the day. "What did we know on 12 March" is answered from those, never from
+    the case row, which is refreshed in place because a hearing date moving is
+    not a second answer to the same question. 200 rather than 201 because a
+    refused run creates nothing at all, and `history_id` is the honest signal of
+    whether anything was written.
+
+    Refusals come back on the body rather than as errors: "we searched and could
+    confirm nothing" is a result an operator has to be shown, most often
+    PROFILE_NOT_IDENTIFIER_RESOLVED — meaning the buyer's own identity has never
+    been verified, so nothing found here could ever be confirmed as theirs.
+    """
+    from app.company.verification import BuyerNotFound
+    from app.legal import cases as legal_cases
+
+    try:
+        outcome = legal_cases.search_and_link(
+            session,
+            buyer_id,
+            company_id=principal.company_id,
+            backend=_court_backend(),
+            now=datetime.now(timezone.utc),
+            filed_after=filed_after,
+            actor_label=principal.label or str(principal.user_id),
+        )
+    except BuyerNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such buyer")
+
+    signals = (
+        legal_cases.legal_signals(session, outcome.profile_id)
+        if outcome.profile_id is not None
+        else legal_cases.LegalSignals()
+    )
+    # `search_and_link` writes its own audit row naming the actor passed above,
+    # so a second one here would record the same act twice under two names.
+    session.commit()
+    return CaseSearchOut(
+        profile_id=outcome.profile_id,
+        searched_name=outcome.searched_name,
+        cases_seen=outcome.cases_seen,
+        links=[
+            LegalLinkOut(
+                case_id=link.case_id,
+                court_id=link.court_id,
+                case_number=link.case_number,
+                case_type=link.case_type,
+                link_id=link.link_id,
+                status=link.status,
+                tier=link.tier,
+                confidence=link.confidence,
+                reasons=list(link.reasons),
+            )
+            for link in outcome.links
+        ],
+        refusals=[r.value for r in outcome.refusals],
+        notes=list(outcome.notes),
+        history_id=outcome.history_id,
+        confirmed_legal_cases=signals.confirmed_legal_cases,
+        recovery_suits=signals.recovery_suits,
+        insolvency_cases=signals.insolvency_cases,
+        awaiting_review=signals.awaiting_review,
+    )
+
+
+@trade_router.get("/buyers/{buyer_id}/court-cases", response_model=CaseSearchOut)
+def list_court_cases(
+    buyer_id: UUID,
+    session: Session = Depends(tenant_db),
+    _: Principal = Depends(require(Permission.BUYER_READ)),
+):
+    """Every link proposed or decided for this buyer, with the counts that score.
+
+    Rejected links are returned too. A case somebody has already looked at and
+    said is not this company's is exactly the case that will be proposed again
+    on the next search, and hiding the rejection invites the same review twice.
+    """
+    from app.legal import cases as legal_cases
+
+    _buyer_or_404(session, buyer_id)
+    profile = _buyer_profile(session, buyer_id)
+    if profile is None:
+        return CaseSearchOut(notes=["this buyer has no company profile"])
+
+    rows = session.execute(
+        select(LegalLink, CourtCase)
+        .join(CourtCase, CourtCase.id == LegalLink.case_id)
+        .where(LegalLink.profile_id == profile.id)
+        .order_by(CourtCase.filing_date.desc())
+    ).all()
+    signals = legal_cases.legal_signals(session, profile.id)
+    return CaseSearchOut(
+        profile_id=profile.id,
+        searched_name=profile.legal_name,
+        cases_seen=len(rows),
+        links=[_link_out(link, case) for link, case in rows],
+        confirmed_legal_cases=signals.confirmed_legal_cases,
+        recovery_suits=signals.recovery_suits,
+        insolvency_cases=signals.insolvency_cases,
+        awaiting_review=signals.awaiting_review,
+    )
+
+
+@trade_router.post("/legal-links/{link_id}/review")
+def review_legal_link(
+    link_id: UUID,
+    body: LegalLinkReviewIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.LEGAL_LINK_CONFIRM)),
+):
+    """Decide whether a case is this company's.
+
+    Confirming is refused unless the filing itself recorded an identifier
+    against a party and that identifier is one the registry holds for this
+    buyer. A perfect name match, a director named as a respondent, the company's
+    own GSTIN sitting in a recital — all of them come back 409, and a reviewer
+    who wants to confirm anyway cannot: the grade is recomputed from the stored
+    case and the profile's *current* identifiers, never read back from the
+    link's signals.
+
+    Rejecting is unconditional, because detaching a case is always safe.
+    """
+    from app.legal import cases as legal_cases
+
+    _require_named_user(principal, "deciding whose litigation this is")
+
+    now = datetime.now(timezone.utc)
+    actor = principal.label or str(principal.user_id)
+    try:
+        if body.decision == "CONFIRM":
+            link = legal_cases.confirm_link(
+                session,
+                link_id,
+                company_id=principal.company_id,
+                reviewed_by=principal.user_id,
+                now=now,
+                actor_label=actor,
+            )
+        else:
+            reason = (body.reason or "").strip()
+            if not reason:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "say why this case is not theirs; the rejection is what stops "
+                    "the same case coming back through review unexplained",
+                )
+            link = legal_cases.reject_link(
+                session,
+                link_id,
+                company_id=principal.company_id,
+                reviewed_by=principal.user_id,
+                reason=reason,
+                now=now,
+                actor_label=actor,
+            )
+    except legal_cases.LinkRefused as exc:
+        session.rollback()
+        if exc.reason is legal_cases.Refusal.LINK_NOT_FOUND:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, exc.detail)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"{exc.reason.value}: {exc.detail}"
+        )
+
+    # `confirm_link` and `reject_link` each write their own audit row naming the
+    # reviewer passed above; a second one here would double-count the decision.
+    session.commit()
+    return {"link_id": str(link.id), "status": link.status}
+
+
+@trade_router.post(
+    "/accounts/{account_id}/prelegal-assessment", response_model=PrelegalOut, status_code=201
+)
+def assess_prelegal(
+    account_id: UUID,
+    body: PrelegalIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.BUYER_WRITE)),
+):
+    """Assess whether this account is ready for a demand notice.
+
+    A recommendation and nothing else, which is why it sits at `BUYER_WRITE`
+    alongside the credit check rather than behind a legal permission: it
+    publishes nothing, sends nothing, and its most common answer is NOT_READY.
+    The gate belongs on the notice, and there is no route that sends one.
+
+    201 for the same reason as every other assessment here — it appends, because
+    the question afterwards is always "what did you know when you decided to
+    send it". Only court links a person has confirmed reach it; cases awaiting
+    review are reported as a count and change nothing.
+    """
+    from app.legal import assessment as legal_assessment
+
+    try:
+        outcome = legal_assessment.assess_account(
+            session,
+            account_id,
+            company_id=principal.company_id,
+            now=datetime.now(timezone.utc),
+            delivered_contacts_at_l2=body.delivered_contacts_at_l2,
+            has_delivery_proof=body.has_delivery_proof,
+            last_acknowledgement=body.last_acknowledgement,
+            last_part_payment=body.last_part_payment,
+            assessed_by=principal.user_id,
+            actor_label=principal.label or str(principal.user_id),
+        )
+    except legal_assessment.AccountNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "account not found")
+
+    # `assess_account` records the assessment in the audit trail itself, naming
+    # the actor passed above.
+    session.commit()
+    result = outcome.assessment
+    return PrelegalOut(
+        assessment_id=outcome.assessment_id,
+        account_id=account_id,
+        outcome=result.outcome.value,
+        factors=list(result.factors),
+        blockers=list(result.blockers),
+        estimated_cost_paise=result.estimated_cost_paise,
+        estimated_cost_display=format_inr(result.estimated_cost_paise),
+        recoverable_paise=result.recoverable_paise,
+        recoverable_display=format_inr(result.recoverable_paise),
+        limitation_expires_on=result.limitation_expires_on,
+        limitation_urgent=result.limitation_urgent,
+        confirmed_legal_cases=outcome.legal.confirmed_legal_cases,
+        recovery_suits=outcome.legal.recovery_suits,
+        insolvency_cases=outcome.legal.insolvency_cases,
+        awaiting_review=outcome.legal.awaiting_review,
+    )
 
 
 # ----------------------------------------------------------------- ingestion
@@ -1619,6 +3016,142 @@ def list_campaigns(
     _: Principal = Depends(require(Permission.CAMPAIGN_READ)),
 ):
     return list(session.execute(select(Campaign).order_by(Campaign.created_at.desc())).scalars())
+
+
+def _time_or_422(raw: str, field: str) -> time:
+    try:
+        return _parse_time(raw)
+    except ValueError:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{field} must look like '09:30'; got {raw!r}",
+        )
+
+
+@campaign_router.patch("/{campaign_id}", response_model=CampaignOut)
+def update_campaign(
+    campaign_id: UUID,
+    body: CampaignPatchIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.CAMPAIGN_WRITE)),
+):
+    """Change a campaign's window, cadence or channels.
+
+    Editable while the campaign is running, deliberately. The usual reason a
+    window gets narrowed is a complaint about the calls going out under it, and
+    making that wait for a pause means the calls carry on while somebody looks
+    for the button.
+
+    The 08:00-19:00 ceiling and `window_end > window_start` are check
+    constraints on the table; those are the authority. They are re-stated here
+    only so that an operator who gets it wrong reads a sentence instead of a
+    driver error.
+    """
+    campaign = session.get(Campaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "campaign not found")
+
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "no campaign field was sent"
+        )
+    # Absent means "leave it alone"; an explicit null means "clear it", and none
+    # of these can be cleared — the scheduler reads every one on every tick.
+    # Refused rather than skipped, for the same reason an unknown key is.
+    cleared = sorted(k for k, v in fields.items() if v is None)
+    if cleared:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{', '.join(cleared)} cannot be cleared; omit a field to leave it "
+            f"unchanged",
+        )
+
+    window_start = (
+        _time_or_422(fields["window_start"], "window_start")
+        if "window_start" in fields
+        else campaign.window_start
+    )
+    window_end = (
+        _time_or_422(fields["window_end"], "window_end")
+        if "window_end" in fields
+        else campaign.window_end
+    )
+    if window_end <= window_start:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"the calling window must end after it starts; got "
+            f"{window_start.isoformat()} to {window_end.isoformat()}",
+        )
+    if window_start < time(8, 0) or window_end > time(19, 0):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "recovery calls are permitted between 08:00 and 19:00 local time; "
+            "that ceiling is a property of the system, not a campaign setting",
+        )
+
+    channels = fields.get("channels")
+    if channels is not None:
+        unknown = sorted(set(channels) - {c.value for c in Channel})
+        if unknown:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"unknown channel(s): {', '.join(unknown)}",
+            )
+
+    before = {
+        "name": campaign.name,
+        "timezone": campaign.timezone,
+        "window_start": campaign.window_start.isoformat(),
+        "window_end": campaign.window_end.isoformat(),
+        "call_on_weekends": campaign.call_on_weekends,
+        "max_attempts_per_day": campaign.max_attempts_per_day,
+        "max_attempts_per_week": campaign.max_attempts_per_week,
+        "min_hours_between_calls": campaign.min_hours_between_calls,
+        "channels": list(campaign.channels or []),
+    }
+
+    for field in (
+        "name",
+        "timezone",
+        "call_on_weekends",
+        "max_attempts_per_day",
+        "max_attempts_per_week",
+        "min_hours_between_calls",
+    ):
+        if field in fields:
+            setattr(campaign, field, fields[field])
+    campaign.window_start = window_start
+    campaign.window_end = window_end
+    if channels is not None:
+        campaign.channels = list(channels)
+
+    after = {
+        "name": campaign.name,
+        "timezone": campaign.timezone,
+        "window_start": campaign.window_start.isoformat(),
+        "window_end": campaign.window_end.isoformat(),
+        "call_on_weekends": campaign.call_on_weekends,
+        "max_attempts_per_day": campaign.max_attempts_per_day,
+        "max_attempts_per_week": campaign.max_attempts_per_week,
+        "min_hours_between_calls": campaign.min_hours_between_calls,
+        "channels": list(campaign.channels or []),
+    }
+    audit.record_for(
+        session,
+        principal,
+        action="campaign.updated",
+        entity_type="campaign",
+        entity_id=campaign_id,
+        # The whole settings block both sides rather than only the moved keys.
+        # "What was this campaign allowed to do on the day it rang them" is the
+        # question these rows get read for, and a diff does not answer it.
+        before=before,
+        after=after,
+    )
+    session.commit()
+    session.refresh(campaign)
+    return campaign
 
 
 @campaign_router.post("/{campaign_id}/enrol")
@@ -1793,7 +3326,7 @@ def _profile_out(session: Session, company: Company) -> CompanyProfileOut:
     ).scalar_one()
     outstanding = session.execute(
         select(func.coalesce(func.sum(CreditAccount.outstanding_paise), 0)).where(
-            CreditAccount.status != AccountStatus.SETTLED
+            CreditAccount.status.notin_(CLOSED_ACCOUNT_STATUSES)
         )
     ).scalar_one()
     return CompanyProfileOut(
@@ -1865,6 +3398,99 @@ def update_company_profile(
     )
     session.commit()
     return _profile_out(session, company)
+
+
+# ------------------------------------------------------------- no-call days
+#
+# Under /portal rather than /campaigns because a blackout is a property of the
+# company, not of one campaign: every campaign the tenant runs is silent on
+# these days. Filing them under a campaign would invite a second set beside a
+# second campaign, and the day a festival is observed is not something two
+# campaigns should be able to disagree about.
+
+
+@portal_router.get("/blackout-dates", response_model=list[BlackoutDateOut])
+def list_blackout_dates(
+    session: Session = Depends(tenant_db),
+    _: Principal = Depends(require(Permission.CAMPAIGN_READ)),
+    from_day: date | None = None,
+):
+    """Readable by anyone who can read campaigns — "why did nothing dial on
+    Tuesday" is the question an operator asks first, and it should not need an
+    admin to answer."""
+    stmt = select(BlackoutDate).order_by(BlackoutDate.day)
+    if from_day is not None:
+        stmt = stmt.where(BlackoutDate.day >= from_day)
+    return list(session.execute(stmt).scalars())
+
+
+@portal_router.post("/blackout-dates", response_model=BlackoutDateOut, status_code=201)
+def add_blackout_date(
+    body: BlackoutDateIn,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.COMPANY_SETTINGS)),
+):
+    """Stop all contact on one day.
+
+    `COMPANY_SETTINGS`, alongside the creditor's own profile, because this
+    silences every campaign at once — collection calls on a major festival
+    generate complaints that cost more than the day of calling was worth, and
+    the converse mistake, removing a day, is just as company-wide.
+    """
+    row = BlackoutDate(
+        company_id=principal.company_id, day=body.day, label=body.label
+    )
+    session.add(row)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{body.day.isoformat()} is already a blackout date",
+        )
+    audit.record_for(
+        session,
+        principal,
+        action="company.blackout_added",
+        entity_type="blackout_date",
+        entity_id=row.id,
+        after={"day": body.day.isoformat(), "label": body.label},
+    )
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+@portal_router.delete("/blackout-dates/{blackout_id}", status_code=200)
+def remove_blackout_date(
+    blackout_id: UUID,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(require(Permission.COMPANY_SETTINGS)),
+):
+    """Delete rather than flag, unlike everything evidential here.
+
+    A blackout is a setting: it says what the dialler may do tomorrow, and it is
+    not evidence of anything that happened. What must survive is the change
+    itself, which is why the audit row carries the day and the label in `before`
+    — deleting the row must not delete the fact that somebody re-opened a day
+    for calling.
+    """
+    row = session.get(BlackoutDate, blackout_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such blackout date")
+    removed = {"day": row.day.isoformat(), "label": row.label}
+    session.delete(row)
+    audit.record_for(
+        session,
+        principal,
+        action="company.blackout_removed",
+        entity_type="blackout_date",
+        entity_id=blackout_id,
+        before=removed,
+    )
+    session.commit()
+    return {"status": "removed", **removed}
 
 
 @portal_router.get("/state")
@@ -1983,14 +3609,14 @@ def portal_list(
                     CreditAccount.buyer_id,
                     func.coalesce(func.sum(CreditAccount.outstanding_paise), 0),
                 )
-                .where(CreditAccount.status != AccountStatus.SETTLED)
+                .where(CreditAccount.status.notin_(CLOSED_ACCOUNT_STATUSES))
                 .group_by(CreditAccount.buyer_id)
             ).all()
         )
         oldest = dict(
             session.execute(
                 select(CreditAccount.buyer_id, func.min(CreditAccount.due_date))
-                .where(CreditAccount.status != AccountStatus.SETTLED)
+                .where(CreditAccount.status.notin_(CLOSED_ACCOUNT_STATUSES))
                 .group_by(CreditAccount.buyer_id)
             ).all()
         )
@@ -2205,8 +3831,55 @@ def list_messages(
     ]
 
 
+# ------------------------------------------------------------------- the trail
+
+audit_router = APIRouter(prefix="/audit", tags=["audit"])
+
+
+@audit_router.get("", response_model=list[AuditEntryOut])
+def list_audit(
+    session: Session = Depends(tenant_db),
+    _: Principal = Depends(require(Permission.AUDIT_READ)),
+    entity_type: str | None = Query(None),
+    entity_id: UUID | None = Query(None),
+    action: str | None = Query(None),
+    since: datetime | None = Query(None),
+    until: datetime | None = Query(None),
+    limit: int = Query(100, le=500),
+) -> list[AuditEntryOut]:
+    """Read the trail. Until this existed, `AUDIT_READ` granted nothing.
+
+    The trail is append-only in the database and was unreadable through the
+    product, which is the same as not having one when somebody asks. Consent is
+    the case that makes it urgent: `restore_consent` clears both consent columns
+    on the buyer, so the row written from `before` is the only surviving
+    evidence that a withdrawal ever happened — filter by
+    `entity_type=buyer&entity_id=<id>` to read that history back.
+
+    Tenant-scoped by RLS like every other read here, so no `company_id`
+    predicate belongs in the query.
+    """
+    stmt = select(AuditLog)
+    if entity_type is not None:
+        stmt = stmt.where(AuditLog.entity_type == entity_type)
+    if entity_id is not None:
+        stmt = stmt.where(AuditLog.entity_id == entity_id)
+    if action is not None:
+        stmt = stmt.where(AuditLog.action == action)
+    if since is not None:
+        stmt = stmt.where(AuditLog.occurred_at >= since)
+    if until is not None:
+        stmt = stmt.where(AuditLog.occurred_at <= until)
+
+    rows = session.execute(
+        stmt.order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc()).limit(limit)
+    ).scalars()
+    return [AuditEntryOut.model_validate(row) for row in rows]
+
+
 for sub in (
     auth_router,
+    audit_router,
     portal_router,
     analytics_router,
     public_router,

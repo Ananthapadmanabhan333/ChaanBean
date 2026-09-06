@@ -55,11 +55,35 @@ from app.providers.base import ContactBlocked, assert_contactable
 from app.render.service import RenderFailed, ensure_audio
 from app.render.template import MergeContext
 from app.telephony.flow import CallBlocked, derive_idempotency_key, resolve_caller_id
+from app.trade.accounts import ensure_escalation_state
 from app.trade.ageing import days_past_due
 
 log = logging.getLogger(__name__)
 
 RETRY_AFTER_BLOCK = timedelta(hours=4)
+
+# Refusals that no retry, no scrub and no passage of time will clear. The ladder
+# deliberately holds an unreached debtor at L2 rather than escalating them to
+# legal content, and a debtor whose every valid number is on the registry can
+# never be reached by automation at all. Both are designed dead ends whose only
+# exit is a person, and until this set existed nothing put them in front of one.
+#
+# DND_UNKNOWN and DND_CHECK_STALE are deliberately absent: a scrub clears both,
+# and queueing them for a human would bury the two refusals that need one.
+_NEEDS_HUMAN_REVIEW = frozenset(
+    {
+        policy.BlockReason.L3_REQUIRES_PRIOR_CONTACT.value,
+        policy.BlockReason.DND_REGISTERED.value,
+    }
+)
+
+# Refusals that only a person lifts, so a retry timer is the wrong answer.
+# Consent is the whole of the set: restoring it is a deliberate admin act with
+# its own permission, and nothing else here reverses. DND_REGISTERED is
+# deliberately absent — a scrub can change that answer, and parking on it would
+# leave the buyer waiting on a review queue whose resolution does not re-arm the
+# scheduler.
+_PARKS_THE_BUYER = frozenset({policy.BlockReason.CONSENT_WITHDRAWN.value})
 
 
 @dataclass
@@ -263,32 +287,126 @@ def record_block(
     account_id: UUID | None,
     level,
     now: datetime,
+    channel: Channel | None = None,
     retry_after: timedelta = RETRY_AFTER_BLOCK,
-) -> Call:
-    """A refusal is a row, never a silence."""
-    call = Call(
-        company_id=campaign.company_id,
-        campaign_id=campaign.id,
-        buyer_id=buyer.id,
-        account_id=account_id or _any_account(session, buyer.id),
-        level=level or policy.EscalationLevel.L1,
-        to_e164="",
-        scheduled_at=now,
-        status=CallStatus.BLOCKED,
-        block_reason=reason,
-        counts_against_cap=False,
-        idempotency_key=f"blocked:{buyer.id}:{now.isoformat()}:{reason}",
-    )
-    session.add(call)
-    buyer.next_action_at = now + retry_after
+) -> Call | Message:
+    """A refusal is a row, never a silence.
+
+    The row goes in the table for the channel that was refused. A blocked SMS
+    written as a Call with an empty `to_e164` is not merely untidy: every block
+    report counts it as a call that never happened, so an operator debugging a
+    silent messaging campaign reads a dialler failure instead.
+
+    Refusals raised before the policy engine has chosen a channel have none, and
+    a Call row remains the right home for those.
+    """
+    account_id = account_id or _any_account(session, buyer.id)
+    level = level or policy.EscalationLevel.L1
+
+    if channel is not None and channel is not Channel.VOICE:
+        row: Call | Message = Message(
+            company_id=campaign.company_id,
+            campaign_id=campaign.id,
+            buyer_id=buyer.id,
+            account_id=account_id,
+            channel=channel,
+            level=level,
+            to_address="",
+            rendered_body="",
+            status=MessageStatus.BLOCKED,
+            block_reason=reason,
+            counts_against_cap=False,
+            idempotency_key=f"blocked:{buyer.id}:{now.isoformat()}:{reason}",
+        )
+    else:
+        row = Call(
+            company_id=campaign.company_id,
+            campaign_id=campaign.id,
+            buyer_id=buyer.id,
+            account_id=account_id,
+            level=level,
+            to_e164="",
+            scheduled_at=now,
+            status=CallStatus.BLOCKED,
+            block_reason=reason,
+            counts_against_cap=False,
+            idempotency_key=f"blocked:{buyer.id}:{now.isoformat()}:{reason}",
+        )
+    session.add(row)
+
+    if reason in _NEEDS_HUMAN_REVIEW and account_id is not None:
+        _flag_for_review(session, account_id, reason=reason, detail=detail, now=now)
+
+    if reason in _PARKS_THE_BUYER:
+        # `None` is how this codebase says "nothing further is due for this
+        # buyer". `record_consent_withdrawal` sets it for exactly this reason,
+        # and a retry timer here would undo it — waking every four hours to
+        # write the same refusal about a person who asked to be left alone, and
+        # keeping their campaign target alive because the sweep reads a
+        # non-null wake-up as unfinished work.
+        buyer.next_action_at = None
+    else:
+        buyer.next_action_at = now + retry_after
     session.flush()
     log.info("buyer %s blocked: %s (%s)", buyer.id, reason, detail)
-    return call
+    return row
+
+
+def _flag_for_review(
+    session: Session, account_id: UUID, *, reason: str, detail: str, now: datetime
+) -> None:
+    """Put one account in front of a person, with why written down.
+
+    The ladder state is created if it is missing. An account can hit
+    DND_REGISTERED on its very first dispatch, before anything has written a
+    ladder position, and a review queue that silently drops those is the queue
+    not existing.
+    """
+    account = session.get(CreditAccount, account_id)
+    if account is None:
+        return
+    state = ensure_escalation_state(session, account, now=now)
+    if state.needs_human_review:
+        # A transition, like the ladder stop. The refusals in this set do not
+        # clear on their own, so the buyer comes back every four hours; writing
+        # the flag and the history entry again on each pass buries the queue in
+        # duplicates of one unresolved fact and leaves a reviewer unable to tell
+        # a new problem from an old one.
+        return
+    state.needs_human_review = True
+    state.history = list(state.history or []) + [
+        {
+            "at": now.isoformat(),
+            "event": "needs_human_review",
+            "reason": reason,
+            "detail": detail,
+        }
+    ]
+
+
+def _blocked_result(
+    row: Call | Message, *, buyer_id: UUID, reason: str, detail: str = ""
+) -> DispatchResult:
+    is_message = isinstance(row, Message)
+    return DispatchResult(
+        buyer_id,
+        False,
+        channel=row.channel if is_message else None,
+        reason=reason,
+        call_id=None if is_message else row.id,
+        message_id=row.id if is_message else None,
+        detail=detail,
+    )
 
 
 def _any_account(session: Session, buyer_id: UUID) -> UUID | None:
     account = session.execute(
-        select(CreditAccount).where(CreditAccount.buyer_id == buyer_id).limit(1)
+        # Ordered, so a refusal that names no account lands on the same one every
+        # time rather than on whichever row the planner happened to return.
+        select(CreditAccount)
+        .where(CreditAccount.buyer_id == buyer_id)
+        .order_by(CreditAccount.due_date, CreditAccount.id)
+        .limit(1)
     ).scalar_one_or_none()
     return account.id if account else None
 
@@ -318,7 +436,7 @@ def dispatch_buyer(
     decision = policy.evaluate(ctx)
 
     if not decision.allowed:
-        call = record_block(
+        row = record_block(
             session,
             buyer=buyer,
             campaign=campaign,
@@ -327,10 +445,10 @@ def dispatch_buyer(
             account_id=decision.account_id,
             level=decision.level,
             now=now,
+            channel=decision.channel,
         )
-        return DispatchResult(
-            buyer.id, False, reason=decision.reason.value, call_id=call.id,
-            detail=decision.detail,
+        return _blocked_result(
+            row, buyer_id=buyer.id, reason=decision.reason.value, detail=decision.detail
         )
 
     # Re-read the account immediately before contact. A payment or a dispute
@@ -347,7 +465,7 @@ def dispatch_buyer(
             if account and account.status is AccountStatus.IN_DISPUTE
             else policy.BlockReason.ACCOUNT_CLOSED.value
         )
-        call = record_block(
+        row = record_block(
             session,
             buyer=buyer,
             campaign=campaign,
@@ -356,14 +474,15 @@ def dispatch_buyer(
             account_id=decision.account_id,
             level=decision.level,
             now=now,
+            channel=decision.channel,
         )
-        return DispatchResult(buyer.id, False, reason=reason, call_id=call.id)
+        return _blocked_result(row, buyer_id=buyer.id, reason=reason)
 
     # Non-production must not contact a real person (rule 4).
     try:
         assert_contactable(decision.to_address or "")
     except ContactBlocked as exc:
-        call = record_block(
+        row = record_block(
             session,
             buyer=buyer,
             campaign=campaign,
@@ -372,10 +491,11 @@ def dispatch_buyer(
             account_id=decision.account_id,
             level=decision.level,
             now=now,
+            channel=decision.channel,
             retry_after=timedelta(days=3650),
         )
-        return DispatchResult(
-            buyer.id, False, reason="CONTACT_NOT_ALLOWLISTED", call_id=call.id
+        return _blocked_result(
+            row, buyer_id=buyer.id, reason="CONTACT_NOT_ALLOWLISTED"
         )
 
     version = session.get(TemplateVersion, decision.template_version_id)

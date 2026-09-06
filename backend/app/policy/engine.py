@@ -24,7 +24,7 @@ debtor.
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -187,8 +187,19 @@ class Decision:
     detail: str = ""
 
 
-def _block(reason: BlockReason, detail: str = "") -> Decision:
-    return Decision(allowed=False, reason=reason, detail=detail)
+def _block(
+    reason: BlockReason, detail: str = "", *, channel: Channel | None = None
+) -> Decision:
+    """A refusal, carrying the channel wherever one had already been chosen.
+
+    `app.scheduler.dispatch` files the block in the table for the channel it
+    refused, and a blocked SMS written as a Call with an empty number makes
+    every block report count it as a call that never happened — so an operator
+    debugging a silent messaging campaign reads a dialler failure. Refusals
+    raised before any channel is in view genuinely have none, and a Call row is
+    the right home for those.
+    """
+    return Decision(allowed=False, reason=reason, detail=detail, channel=channel)
 
 
 # ------------------------------------------------------------------- level ladder
@@ -345,40 +356,49 @@ def _select_channel(
     """
     considered = [c for c in _CHANNEL_PREFERENCE[level] if c in ctx.channels_enabled]
 
-    saw_opt_out = saw_missing_address = saw_cap = False
+    # The first channel each cause was seen on, so the refusal can be filed in
+    # the table it belongs to. On a single-channel campaign — the case an
+    # operator is usually debugging — it is the only channel there was.
+    saw_opt_out = saw_missing_address = saw_cap = None
 
     for channel in considered:
         if not _templates_for(ctx, level, channel):
             continue
         if channel in ctx.opted_out_channels:
-            saw_opt_out = True
+            saw_opt_out = saw_opt_out or channel
             continue
         if channel in _PHONE_CHANNELS and not has_phone:
-            saw_missing_address = True
+            saw_missing_address = saw_missing_address or channel
             continue
         if channel is Channel.EMAIL and not ctx.email:
-            saw_missing_address = True
+            saw_missing_address = saw_missing_address or channel
             continue
         cap = ctx.max_attempts_per_day_by_channel.get(channel)
         if cap is not None and ctx.attempts_today_by_channel.get(channel, 0) >= cap:
             # Three SMS, one WhatsApp and a call in a day is harassment even when
             # each channel's own cap passed — hence a per-channel cap *and* the
             # shared per-buyer one below.
-            saw_cap = True
+            saw_cap = saw_cap or channel
             continue
         return channel, None
 
     if saw_opt_out:
         return None, _block(
-            BlockReason.CHANNEL_OPTED_OUT, "every usable channel was opted out of"
+            BlockReason.CHANNEL_OPTED_OUT,
+            "every usable channel was opted out of",
+            channel=saw_opt_out,
         )
     if saw_cap:
         return None, _block(
-            BlockReason.CHANNEL_CAP_REACHED, "every usable channel is at its daily cap"
+            BlockReason.CHANNEL_CAP_REACHED,
+            "every usable channel is at its daily cap",
+            channel=saw_cap,
         )
     if saw_missing_address:
         return None, _block(
-            BlockReason.NO_CONTACT_ADDRESS, "no address on file for any usable channel"
+            BlockReason.NO_CONTACT_ADDRESS,
+            "no address on file for any usable channel",
+            channel=saw_missing_address,
         )
     return None, _block(
         BlockReason.NO_TEMPLATE_FOR_LEVEL, f"no template configured for {level.value}"
@@ -393,6 +413,7 @@ def _select_template(
         return None, _block(
             BlockReason.NO_TEMPLATE_FOR_LEVEL,
             f"no {channel.value} template configured for {level.value}",
+            channel=channel,
         )
 
     exact = [t for t in for_level if t.language == ctx.language]
@@ -406,6 +427,7 @@ def _select_template(
         return None, _block(
             BlockReason.L3_TEMPLATE_NOT_APPROVED,
             f"L3 template '{chosen.key}' has no recorded approval",
+            channel=channel,
         )
 
     # An unregistered SMS template is unsendable. Refusing here keeps it a policy
@@ -414,6 +436,7 @@ def _select_template(
         return None, _block(
             BlockReason.SMS_TEMPLATE_NOT_REGISTERED,
             f"SMS template '{chosen.key}' has no TRAI DLT registration",
+            channel=channel,
         )
     return chosen, None
 
@@ -507,12 +530,15 @@ def evaluate(ctx: DecisionContext) -> Decision:
         # phone channel and could not have one — DND_REGISTERED tells an operator
         # what to fix, NO_CONTACT_ADDRESS does not.
         if phone_block is not None and blocked.reason is BlockReason.NO_CONTACT_ADDRESS:
-            return phone_block
+            # The phone refusal is the more useful sentence, but it was raised
+            # before any channel was in view; the channel comes from the refusal
+            # it replaces so the row is still filed in the right table.
+            return replace(phone_block, channel=blocked.channel)
         return blocked
     assert channel is not None
 
     if channel in _PHONE_CHANNELS and phone_block is not None:
-        return phone_block
+        return replace(phone_block, channel=channel)
 
     template, blocked = _select_template(ctx, level, channel)
     if blocked is not None:

@@ -24,6 +24,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -214,6 +215,18 @@ class Invoice(Base, TimestampMixin):
     )
     currency: Mapped[str] = mapped_column(String(3), default="INR", nullable=False)
 
+    # Why this invoice stopped being pursued, and who decided that.
+    #
+    # The ladder history records the stop as well, but that is JSONB on a
+    # recovery-side table and it is lost entirely for an invoice whose account
+    # never had an escalation row. "Why did we abandon this debt" has to be
+    # answerable by query and has to survive into an audit export, so it lives on
+    # the invoice it describes. Written by the route that closes the invoice;
+    # `app.trade.reduction` sets the status and never touches these three.
+    closure_reason: Mapped[str | None] = mapped_column(Text)
+    closed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     lines: Mapped[list[InvoiceLine]] = relationship(
         back_populates="invoice", cascade="all, delete-orphan"
     )
@@ -254,6 +267,24 @@ class Payment(Base, TimestampMixin):
             "unallocated_paise <= amount_paise", name="ck_payment_unallocated_within_amount"
         ),
         Index("ix_payments_buyer_received", "buyer_id", "received_date"),
+        # A replayed reference — a resubmitted form, a retried request, an ERP
+        # replaying a webhook — is one receipt, and allocating it twice tells the
+        # debtor they owe less than they do. Declared here as well as in
+        # b7c2e5140af9 because `app.db init` builds the schema from this metadata
+        # and would otherwise produce a database with no such guard, which is the
+        # database `make test` runs against.
+        #
+        # Partial because `reference` is legitimately null (cash over a counter),
+        # and scoped to the buyer because two customers' banks may issue the same
+        # UTR-shaped string. Mirrors `uq_active_target_per_buyer`.
+        Index(
+            "uq_payment_reference_per_buyer",
+            "company_id",
+            "buyer_id",
+            "reference",
+            unique=True,
+            postgresql_where=text("reference IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()

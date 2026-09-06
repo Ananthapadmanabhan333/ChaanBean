@@ -33,7 +33,9 @@ from app.models import (
     CallStatus,
     EscalationState,
 )
+from app.identity import audit
 from app.policy import classify_attempt, next_retry_delay, record_attempt
+from app.trade import consent
 
 
 def apply_outcome(session: Session, call: Call, *, now: datetime | None = None) -> Call:
@@ -57,8 +59,32 @@ def apply_outcome(session: Session, call: Call, *, now: datetime | None = None) 
     buyer = session.get(Buyer, call.buyer_id)
 
     if call.opted_out and buyer is not None and not buyer.consent_withdrawn:
-        buyer.consent_withdrawn = True
-        buyer.consent_withdrawn_at = now
+        # Through the one withdrawal function, not by writing the flag. A
+        # keypress is the same instruction as a letter, and recording it any
+        # other way leaves the scheduler unparked and the change absent from an
+        # audit export of consent changes — so the only withdrawal channel that
+        # already existed would be the one that left no trace.
+        change = consent.record_consent_withdrawal(
+            session,
+            buyer,
+            reason=f"keypress 9 on call {call.id}",
+            source=consent.ConsentSource.DTMF,
+            now=now,
+        )
+        # Written here rather than by the callers because there are two of them
+        # — the ARI consumer and the reconciler — and neither knows more about
+        # who asked than this does: the debtor, on this call.
+        audit.record(
+            session,
+            action=audit.Action.BUYER_CONSENT_CHANGED,
+            company_id=buyer.company_id,
+            actor_label="dialler (DTMF keypress)",
+            entity_type=change.entity_type,
+            entity_id=change.entity_id,
+            before=change.before,
+            after=change.after,
+            detail=change.detail,
+        )
 
     state = session.execute(
         select(EscalationState).where(EscalationState.account_id == call.account_id)
@@ -84,7 +110,10 @@ def apply_outcome(session: Session, call: Call, *, now: datetime | None = None) 
             }
         ]
 
-    if buyer is not None:
+    # A withdrawn buyer is parked, and a retry timer would unpark them. The call
+    # this outcome closes may have been dialled two minutes before the
+    # withdrawal was recorded, so this is not a hypothetical ordering.
+    if buyer is not None and not buyer.consent_withdrawn:
         if klass is AttemptClass.TERMINAL_BAD_NUMBER and not _has_other_valid_phone(
             session, buyer, call.phone_id
         ):

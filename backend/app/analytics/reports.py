@@ -38,6 +38,7 @@ from app.models import (
     Payment,
 )
 from app.render.numbers import format_inr
+from app.trade import UNCOLLECTABLE_STATUSES
 from app.trade.ageing import ageing_bucket, days_past_due
 
 
@@ -62,7 +63,7 @@ def ageing_summary(session: Session, as_of: date) -> dict:
     invoices = session.execute(
         select(Invoice).where(
             Invoice.issue_date <= as_of,
-            Invoice.status.notin_([InvoiceStatus.CANCELLED, InvoiceStatus.WRITTEN_OFF]),
+            Invoice.status.notin_(UNCOLLECTABLE_STATUSES),
         )
     ).scalars()
 
@@ -161,28 +162,42 @@ def contact_effectiveness(session: Session, as_of: date, *, days: int = 30) -> d
 
 
 def block_reason_breakdown(session: Session, as_of: date, *, days: int = 30) -> dict:
-    """Why calls did not happen. The answer to "why isn't it calling anyone"."""
+    """Why contact did not happen. The answer to "why isn't it doing anything".
+
+    Both tables. A refusal is filed against the channel it refused, so a
+    messaging campaign's blocks are Message rows — and counting calls alone
+    reports a silent SMS campaign as zero blocks, which is the opposite of what
+    this report exists to tell an operator.
+    """
     since = _as_datetime(as_of - timedelta(days=days))
-    rows = session.execute(
-        select(Call.block_reason, func.count())
-        .where(
-            Call.status == CallStatus.BLOCKED,
-            Call.created_at >= since,
-        )
-        .group_by(Call.block_reason)
-        .order_by(func.count().desc())
-    ).all()
-    total = sum(int(n) for _, n in rows)
+    counts: dict[str | None, int] = {}
+    for reason, count in (
+        session.execute(
+            select(Call.block_reason, func.count())
+            .where(Call.status == CallStatus.BLOCKED, Call.created_at >= since)
+            .group_by(Call.block_reason)
+        ).all()
+        + session.execute(
+            select(Message.block_reason, func.count())
+            .where(Message.status == MessageStatus.BLOCKED, Message.created_at >= since)
+            .group_by(Message.block_reason)
+        ).all()
+    ):
+        counts[reason] = counts.get(reason, 0) + int(count)
+
+    total = sum(counts.values())
     return {
         "as_of": as_of.isoformat(),
         "total_blocked": total,
         "reasons": [
             {
                 "reason": reason or "UNSPECIFIED",
-                "count": int(count),
-                "share": round(int(count) / total, 3) if total else 0,
+                "count": count,
+                "share": round(count / total, 3) if total else 0,
             }
-            for reason, count in rows
+            for reason, count in sorted(
+                counts.items(), key=lambda item: item[1], reverse=True
+            )
         ],
     }
 

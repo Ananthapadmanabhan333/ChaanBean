@@ -20,6 +20,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.ingestion import csv_import
 from app.ingestion.normalise import NormalisationError, normalise_phone
 from app.models import (
     AccountStatus,
@@ -32,7 +33,7 @@ from app.models import (
     Payment,
     ProviderFetch,
 )
-from app.trade import accounts
+from app.trade import CLOSED_ACCOUNT_STATUSES, UNCOLLECTABLE_STATUSES, accounts, reduction
 from app.trade.allocation import apply_payment
 
 
@@ -97,9 +98,20 @@ def sync_parties(session: Session, company_id: UUID, provider: str, parties) -> 
             session.flush()
             outcome.created += 1
         elif buyer.name != party.name or (party.email and buyer.email != party.email):
-            buyer.name = party.name
-            if party.email:
-                buyer.email = party.email
+            # The same overwrite the CSV path performs, and audited for the same
+            # reason: this is the second writer of the fields a data principal
+            # corrects through `PATCH /trade/buyers/{id}`, and an unrecorded
+            # revert of a correction is the one thing that route's evidence
+            # cannot survive.
+            csv_import.overwrite_contact(
+                session,
+                buyer,
+                name=party.name,
+                email=party.email,
+                company_id=company_id,
+                actor_id=None,
+                actor_label=f"erp sync ({provider})",
+            )
             outcome.updated += 1
         else:
             outcome.unchanged += 1
@@ -141,12 +153,29 @@ def _under_active_recovery(session: Session, invoice: Invoice) -> bool:
     account = accounts.account_for_invoice(session, invoice.id)
     if account is None:
         return False
-    if account.status in (AccountStatus.SETTLED, AccountStatus.WRITTEN_OFF):
+    if account.status in CLOSED_ACCOUNT_STATUSES:
         return False
     state = account.escalation
     if state is None:
         return False
     return state.level is not EscalationLevel.L1 or state.attempts_at_level > 0
+
+
+def _flag_for_review(session: Session, invoice: Invoice, entry: dict) -> None:
+    """Put one invoice's account in front of a person, with why written down.
+
+    The ladder row is created if it is missing: an invoice can arrive already
+    voided upstream, before anything has written a ladder position, and a review
+    queue that silently drops those is the queue not existing.
+    """
+    account = accounts.account_for_invoice(session, invoice.id)
+    if account is None:
+        return
+    state = accounts.ensure_escalation_state(session, account)
+    state.needs_human_review = True
+    state.history = list(state.history or []) + [
+        {"at": datetime.now(timezone.utc).isoformat(), **entry}
+    ]
 
 
 def sync_invoices(session: Session, company_id: UUID, provider: str, invoices) -> SyncOutcome:
@@ -202,28 +231,51 @@ def sync_invoices(session: Session, company_id: UUID, provider: str, invoices) -
 
         if raw_invoice.voided:
             # Marked, never hard-deleted: there are call recordings referencing it.
-            invoice.status = InvoiceStatus.CANCELLED
-            invoice.outstanding_paise = 0
-            account = accounts.account_for_invoice(session, invoice.id)
-            if account is not None:
-                account.status = AccountStatus.WRITTEN_OFF
+            #
+            # Through `reduction.cancel_invoice` rather than by hand, because the
+            # rules for voiding a debt live there: the balance goes through its
+            # single writer, the recovery projection follows, and the ladder
+            # records that it stopped. Voiding an invoice that has money against
+            # it is refused there for a reason a sync cannot overrule — dropping
+            # the debit while the payment stays as a credit leaves the buyer's
+            # balance short by the invoice, reading on a statement already sent
+            # as though they had overpaid. Upstream saying otherwise is exactly
+            # the case a person has to resolve.
+            if invoice.status is InvoiceStatus.CANCELLED:
+                outcome.unchanged += 1
+                continue
+            try:
+                reduction.cancel_invoice(
+                    session, invoice, reason=f"voided upstream in {provider}"
+                )
+            except reduction.ReductionError as exc:
+                _flag_for_review(
+                    session,
+                    invoice,
+                    {
+                        "event": "upstream_void_refused",
+                        "refusal": exc.refusal.value,
+                        "detail": exc.detail,
+                    },
+                )
+                outcome.note_error(raw_invoice.external_id, str(exc))
+                outcome.flagged += 1
+                continue
             outcome.updated += 1
             continue
 
         if invoice.net_paise != raw_invoice.amount_paise:
             if _under_active_recovery(session, invoice):
                 # We may already have told this debtor a figure. A human decides.
-                account = accounts.account_for_invoice(session, invoice.id)
-                if account is not None and account.escalation is not None:
-                    account.escalation.needs_human_review = True
-                    account.escalation.history = list(account.escalation.history or []) + [
-                        {
-                            "at": datetime.now(timezone.utc).isoformat(),
-                            "event": "upstream_amount_changed",
-                            "from_paise": invoice.net_paise,
-                            "to_paise": raw_invoice.amount_paise,
-                        }
-                    ]
+                _flag_for_review(
+                    session,
+                    invoice,
+                    {
+                        "event": "upstream_amount_changed",
+                        "from_paise": invoice.net_paise,
+                        "to_paise": raw_invoice.amount_paise,
+                    },
+                )
                 outcome.flagged += 1
                 continue
             invoice.gross_paise = raw_invoice.amount_paise
@@ -330,7 +382,7 @@ def compare_totals(session: Session, company_id: UUID, source_total_paise: int) 
         session.execute(
             select(Invoice).where(
                 Invoice.company_id == company_id,
-                Invoice.status.notin_([InvoiceStatus.CANCELLED, InvoiceStatus.WRITTEN_OFF]),
+                Invoice.status.notin_(UNCOLLECTABLE_STATUSES),
             )
         )
         .scalars()

@@ -52,6 +52,39 @@ class Permission(str, enum.Enum):
     # being an operator power: whoever is chasing the money should not also be
     # deciding, on a name resemblance, whose money it is.
     ENTITY_CONFIRM = "entity:confirm"
+    # Recording a payment is operator work because a payment is a fact that can
+    # be checked against a bank statement. A credit note cannot be: it moves a
+    # balance down with no money behind it, on this side's say-so alone. That is
+    # the shape a debt takes when it disappears on purpose, and it should not be
+    # the same permission as running a campaign.
+    LEDGER_CREDIT = "ledger:credit"
+    # Writing off or cancelling ends the pursuit of a debt outright — the ladder
+    # stops, the account closes, nothing dials again. TEMPLATE_APPROVE_L3's
+    # reasoning applies unchanged: the person chasing the money is not the person
+    # who decides to stop chasing it.
+    LEDGER_WRITE_OFF = "ledger:write_off"
+    # Lifting a dispute is the moment a contested debt becomes collectable again,
+    # and the trace it leaves is what app.registry.eligibility reads before
+    # anything is published. An operator able to clear disputes could clear the
+    # one raised against the account they are about to escalate.
+    DISPUTE_CLEAR = "dispute:clear"
+    # Recording a withdrawal stays BUYER_WRITE: the operator taking the call is
+    # exactly who should be able to write down "stop ringing me", and every such
+    # act reduces contact. Undoing one points the dialler back at somebody who
+    # refused — nothing else in the product turns contact on — and getting it
+    # wrong is a DPDP complaint rather than a wasted call.
+    CONSENT_RESTORE = "consent:restore"
+    # Confirming a court link attaches a named company's litigation to a debtor's
+    # file. app.legal.cases refuses anything below an identifier match precisely
+    # because getting it wrong is defamation. Rejecting shares the permission
+    # rather than sitting lower: alone it is safe, but "which cases count" is one
+    # desk, and splitting it would let an operator drop an inconvenient suit out
+    # of the pre-legal assessment.
+    LEGAL_LINK_CONFIRM = "legal:link_confirm"
+    # The review queue exists so that a person looks before the machine resumes.
+    # Whoever is measured on how fast the queue empties should not also be the
+    # one who can empty it without looking.
+    REVIEW_RESOLVE = "review:resolve"
 
 
 _READ_ONLY = frozenset(
@@ -79,12 +112,25 @@ _ADMIN = _OPERATOR | {
     Permission.COMPANY_SETTINGS,
     Permission.AUDIT_READ,
     Permission.ENTITY_CONFIRM,
+    Permission.LEDGER_CREDIT,
+    Permission.LEDGER_WRITE_OFF,
+    Permission.DISPUTE_CLEAR,
+    Permission.CONSENT_RESTORE,
+    Permission.LEGAL_LINK_CONFIRM,
+    Permission.REVIEW_RESOLVE,
 }
 
 # Note what is absent from every role below: TEMPLATE_APPROVE_L3 belongs only to
 # legal_approver, including for the owner. ENTITY_CONFIRM stops at admin for the
 # same kind of reason — an operator may run a verification all day and still not
 # be the one who decides a borderline match names a real company.
+#
+# The six permissions added beside it share one shape. An operator may reduce a
+# debt by recording money that arrived, may write down that a debtor asked to be
+# left alone, and may search the courts all day. What stops at admin is the
+# opposite direction in each pair: reducing a debt with no money behind it,
+# turning contact back on, and deciding that a case found under a similar name
+# is this debtor's.
 ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
     Role.VIEWER: frozenset(_READ_ONLY),
     Role.OPERATOR: frozenset(_OPERATOR),

@@ -27,8 +27,23 @@ def _as_datetime(value) -> datetime:
     return datetime.combine(value, time(0, 0), tzinfo=timezone.utc)
 
 
+# The invoice is finished with, one way or the other, and nothing more should be
+# collected against it.
+_DEAD_INVOICE = (InvoiceStatus.WRITTEN_OFF, InvoiceStatus.CANCELLED)
+
+# Reaching one of these ends the ladder, and the event name it is recorded under.
+_LADDER_STOPS_AT = {
+    AccountStatus.SETTLED: "settled",
+    AccountStatus.WRITTEN_OFF: "written_off",
+}
+
+
 def sync_account_from_invoice(
-    session: Session, invoice: Invoice, *, now: datetime | None = None
+    session: Session,
+    invoice: Invoice,
+    *,
+    reason: str | None = None,
+    now: datetime | None = None,
 ) -> CreditAccount:
     """Create or update the recovery projection of one invoice.
 
@@ -39,6 +54,12 @@ def sync_account_from_invoice(
       paid something is engaging, and escalating at the same pace is how you lose
       a customer who was cooperating.
     * written off    -> WRITTEN_OFF, ladder stops
+    * cancelled      -> WRITTEN_OFF as well. AccountStatus has no CANCELLED, and
+      SETTLED is the wrong home for it: a voided invoice was never paid, and an
+      account that claims otherwise misreports the recovery rate.
+
+    `reason` is carried onto the ladder history entry, so "why did this stop
+    being chased" survives in the one place that keeps a durable trace.
     """
     now = now or datetime.now(timezone.utc)
 
@@ -66,11 +87,14 @@ def sync_account_from_invoice(
     account.due_date = _as_datetime(invoice.due_date)
 
     # A dispute is a human decision and outranks anything the ledger says. It is
-    # cleared deliberately, never by a payment landing.
-    if account.status is AccountStatus.IN_DISPUTE:
+    # cleared deliberately, never by a payment landing — but a write-off or a
+    # cancellation is a *more* terminal human decision, and an account left
+    # IN_DISPUTE over an invoice the creditor has abandoned sits in the review
+    # queue forever.
+    if account.status is AccountStatus.IN_DISPUTE and invoice.status not in _DEAD_INVOICE:
         return account
 
-    if invoice.status is InvoiceStatus.WRITTEN_OFF:
+    if invoice.status in _DEAD_INVOICE:
         account.status = AccountStatus.WRITTEN_OFF
     elif invoice.outstanding_paise == 0:
         account.status = AccountStatus.SETTLED
@@ -79,13 +103,25 @@ def sync_account_from_invoice(
     else:
         account.status = AccountStatus.CURRENT
 
-    if account.status is not previous_status:
+    changed = account.status is not previous_status
+    if changed:
         account.status_updated_at = now
 
-    paid_something = invoice.outstanding_paise < previous_outstanding
-    if account.status is AccountStatus.SETTLED:
-        _stop_ladder(session, account, now)
-    elif paid_something:
+    # Only on the transition. Syncing an already-closed account is routine — an
+    # ERP re-sync, a second payment landing — and appending "settled" on a day
+    # nothing settled turns the one durable trace this product has into noise.
+    stopping_event = _LADDER_STOPS_AT.get(account.status) if changed else None
+    if stopping_event is not None:
+        _stop_ladder(session, account, now, event=stopping_event, reason=reason)
+    elif (
+        invoice.status not in _DEAD_INVOICE
+        and invoice.outstanding_paise < previous_outstanding
+    ):
+        # Only a live debt has a cadence to soften. A credit note against an
+        # abandoned invoice reduces the balance without anybody paying anything,
+        # and rewinding the attempt counter there would record a part payment
+        # that did not happen — and start the ladder from zero if the account
+        # ever came back.
         _reset_cadence(session, account, now)
 
     session.flush()
@@ -98,14 +134,22 @@ def _escalation(session: Session, account: CreditAccount) -> EscalationState | N
     ).scalar_one_or_none()
 
 
-def _stop_ladder(session: Session, account: CreditAccount, now: datetime) -> None:
+def _stop_ladder(
+    session: Session,
+    account: CreditAccount,
+    now: datetime,
+    *,
+    event: str,
+    reason: str | None = None,
+) -> None:
     state = _escalation(session, account)
     if state is None:
         return
     state.needs_human_review = False
-    state.history = list(state.history or []) + [
-        {"at": now.isoformat(), "event": "settled", "level": state.level.value}
-    ]
+    entry = {"at": now.isoformat(), "event": event, "level": state.level.value}
+    if reason:
+        entry["reason"] = reason
+    state.history = list(state.history or []) + [entry]
 
 
 def _reset_cadence(session: Session, account: CreditAccount, now: datetime) -> None:
@@ -124,6 +168,11 @@ def _reset_cadence(session: Session, account: CreditAccount, now: datetime) -> N
     ]
 
 
+DISPUTE_RAISED = "disputed"
+DISPUTE_CLEARED = "dispute_cleared"
+_DISPUTE_EVENTS = frozenset({DISPUTE_RAISED, DISPUTE_CLEARED})
+
+
 def raise_dispute(
     session: Session, account: CreditAccount, *, reason: str, now: datetime | None = None
 ) -> CreditAccount:
@@ -132,27 +181,76 @@ def raise_dispute(
     account.status = AccountStatus.IN_DISPUTE
     account.disputed_reason = reason
     account.status_updated_at = now
-    state = _escalation(session, account)
-    if state is not None:
-        state.needs_human_review = True
-        state.history = list(state.history or []) + [
-            {"at": now.isoformat(), "event": "disputed", "reason": reason}
-        ]
+    # Made rather than looked up: the history is where "was this ever contested"
+    # is answered, and an account with no ladder row yet would otherwise record
+    # the dispute nowhere.
+    state = ensure_escalation_state(session, account, now=now)
+    state.needs_human_review = True
+    state.history = list(state.history or []) + [
+        {"at": now.isoformat(), "event": DISPUTE_RAISED, "reason": reason}
+    ]
     session.flush()
     return account
 
 
 def clear_dispute(
-    session: Session, account: CreditAccount, *, now: datetime | None = None
+    session: Session,
+    account: CreditAccount,
+    *,
+    resolution: str | None = None,
+    now: datetime | None = None,
 ) -> CreditAccount:
+    """Lift a dispute, leaving evidence that there was one.
+
+    `disputed_reason` is nulled because the dispute is over, which makes the
+    ladder history the *only* surviving record of it. That record is load
+    bearing: app.registry.eligibility gates publication on ever-disputed rather
+    than currently-disputed, because a debt that was contested is not a fact to
+    publish even once the contest is withdrawn. Clear a dispute without a trace
+    and the account silently becomes publishable.
+
+    `needs_human_review` is deliberately left alone. Ending a dispute does not
+    end whatever else asked for a person to look — an upstream amount change,
+    say — and the caller releases the account for contact as a separate act.
+    """
     now = now or datetime.now(timezone.utc)
     if account.status is not AccountStatus.IN_DISPUTE:
         return account
+
+    disputed_reason = account.disputed_reason
     account.status = AccountStatus.OVERDUE if account.outstanding_paise else AccountStatus.SETTLED
     account.disputed_reason = None
     account.status_updated_at = now
+
+    state = ensure_escalation_state(session, account, now=now)
+    state.history = list(state.history or []) + [
+        {
+            "at": now.isoformat(),
+            "event": DISPUTE_CLEARED,
+            "disputed_reason": disputed_reason,
+            "resolution": resolution,
+        }
+    ]
     session.flush()
     return account
+
+
+def ever_disputed(session: Session, account: CreditAccount) -> bool:
+    """Has this account been contested at any point, cleared or not?
+
+    The answer app.registry.eligibility needs. It cannot come from
+    `disputed_reason`, which `clear_dispute` nulls, so it comes from the ladder
+    history — which is why that history must never be rewritten in place.
+    """
+    if account.status is AccountStatus.IN_DISPUTE or account.disputed_reason:
+        return True
+    state = _escalation(session, account)
+    if state is None:
+        return False
+    return any(
+        isinstance(entry, dict) and entry.get("event") in _DISPUTE_EVENTS
+        for entry in state.history or []
+    )
 
 
 def ensure_escalation_state(

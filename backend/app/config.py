@@ -59,6 +59,25 @@ class Settings(BaseSettings):
     # USER_PROVIDED and can never reach that tier or be published.
     gst_backend: Literal["local", "manual"] = "local"
     mca_backend: Literal["local", "manual"] = "local"
+    # Do-not-call scrubbing. TRAI's registry is reached through a licensed
+    # scrubbing vendor, and no client for one exists in this build — so `trai`
+    # is a name the factory refuses rather than a mode it can silently fall back
+    # from. See `app.providers.dnd.build_dnd_backend`.
+    dnd_backend: Literal["local", "trai"] = "local"
+    # Court records, and the one adapter where "off" is a real choice rather than
+    # an unfinished state. `local` is a fixture set: plausible invented filings,
+    # useful for exercising the review path and dangerous anywhere near a real
+    # debtor, because an invented recovery suit on a customer's file is
+    # defamation with our name on it. `manual` is what a person transcribed from
+    # a court portal, and reports USER_PROVIDED, so nothing it returns can ever
+    # be confirmed. `none` searches nothing and the route says so — which is the
+    # honest setting until a real eCourts client exists, and therefore the
+    # default. A fabricated GST status is a wrong label on a company; a
+    # fabricated recovery suit is an allegation about one, and the fixture's
+    # identifiers are the same ones `app.seed` gives its demo buyers, so a
+    # seeded buyer reaches identifier grade against invented litigation and the
+    # match becomes confirmable. A demo opts in with COURT_BACKEND=local.
+    court_backend: Literal["local", "manual", "none"] = "none"
 
     # --- contact safety (rule 4) ------------------------------------------
     # Outside production, refuse to contact anyone not on this list. Twenty lines
@@ -179,6 +198,19 @@ class Settings(BaseSettings):
         if not self.contact_allowlist_enforced:
             return False
         return self.env != "local" or self.has_live_delivery_backend
+
+    @property
+    def fixtures_are_dangerous(self) -> bool:
+        """Could a fixture answer here be mistaken for a fact about a real person?
+
+        The same scoping as `enforce_allowlist`, and for the same reason: a
+        local stack with every delivery backend faked is talking to nobody, and
+        a guard that blocks the safe case teaches people to switch it off. The
+        instant a real backend is configured, or the environment says
+        production, an invented DND answer is a number this system will dial and
+        an invented court case is an allegation on a real customer's file.
+        """
+        return self.is_production or self.has_live_delivery_backend
 
     @property
     def uses_real_vendors(self) -> bool:

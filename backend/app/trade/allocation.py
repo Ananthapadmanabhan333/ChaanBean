@@ -34,6 +34,7 @@ from app.models import (
     Payment,
     PaymentAllocation,
 )
+from app.trade import UNCOLLECTABLE_STATUSES
 
 
 class AllocationError(ValueError):
@@ -203,7 +204,7 @@ def invoice_refs(session: Session, buyer_id: UUID, *, lock: bool = False) -> lis
     """
     stmt = select(Invoice).where(
         Invoice.buyer_id == buyer_id,
-        Invoice.status.notin_([InvoiceStatus.CANCELLED, InvoiceStatus.WRITTEN_OFF]),
+        Invoice.status.notin_(UNCOLLECTABLE_STATUSES),
     )
     if lock:
         stmt = stmt.with_for_update()
@@ -257,11 +258,17 @@ def apply_credit_note(session: Session, note: CreditNote) -> None:
 
     A note larger than the balance is a data error worth surfacing, not a
     negative invoice to be explained away later.
+
+    Locked for the same reason `apply_payment` locks: the guard and the
+    recompute below both read the sum of what has been applied, and a payment
+    landing between that read and the write would be overwritten by the balance
+    computed without it — passing the over-credit guard on a stale total and
+    leaving the debtor dunned for money already received.
     """
     if note.invoice_id is None:
         return  # on-account credit; nothing to recompute
 
-    invoice = session.get(Invoice, note.invoice_id)
+    invoice = session.get(Invoice, note.invoice_id, with_for_update=True)
     if invoice is None:
         raise AllocationError(f"credit note {note.note_number} references a missing invoice")
 

@@ -18,11 +18,11 @@ from sqlalchemy.orm import Session
 from app.models import (
     CreditNote,
     Invoice,
-    InvoiceStatus,
     Payment,
     PaymentAllocation,
     Statement,
 )
+from app.trade import VOID_STATUSES
 
 
 class StatementImbalance(AssertionError):
@@ -71,13 +71,22 @@ def _movements(session: Session, buyer_id: UUID, start: date | None, end: date):
     Invoices are debits; payments and credit notes are credits. A payment counts
     only to the extent it was allocated, plus whatever sits on account — money
     received is money received, whether or not it has been applied yet.
+
+    Only cancelled invoices are dropped, and the omission of WRITTEN_OFF is the
+    point: writing a debt off is this side deciding to stop expecting the money,
+    not the invoice ceasing to exist. The buyer still carries the payable, so a
+    statement that quietly dropped it would disagree with their books. Worse,
+    the filter runs on today's status while the period is in the past — excluding
+    written-off invoices would make a February statement stop showing an invoice
+    that was live in February, rewriting a document already sent to the debtor.
+    See app.trade for the same decision as it applies to ageing and allocation.
     """
     lines: list[StatementLine] = []
 
     invoice_q = select(Invoice).where(
         Invoice.buyer_id == buyer_id,
         Invoice.issue_date <= end,
-        Invoice.status != InvoiceStatus.CANCELLED,
+        Invoice.status.notin_(VOID_STATUSES),
     )
     if start is not None:
         invoice_q = invoice_q.where(Invoice.issue_date >= start)

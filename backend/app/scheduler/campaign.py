@@ -24,6 +24,8 @@ from app.models import (
     CampaignStatus,
     CampaignTarget,
     CreditAccount,
+    Message,
+    MessageStatus,
 )
 
 log = logging.getLogger(__name__)
@@ -31,6 +33,18 @@ log = logging.getLogger(__name__)
 
 class CampaignError(RuntimeError):
     pass
+
+
+def _wakeable(buyer: Buyer) -> bool:
+    """May the scheduler be given a wake-up time for this buyer?
+
+    A null `next_action_at` on a buyer who withdrew consent is not an empty
+    field waiting to be filled: it is the park that the withdrawal put there.
+    Seeding it here would restart the four-hourly refusal that parking exists to
+    stop, and enrolling or restarting a campaign is not the act that turns
+    contact back on — restoring consent is.
+    """
+    return buyer.next_action_at is None and not buyer.consent_withdrawn
 
 
 def enrol(
@@ -65,7 +79,7 @@ def enrol(
             )
         )
         buyer = session.get(Buyer, buyer_id)
-        if buyer is not None and buyer.next_action_at is None:
+        if buyer is not None and _wakeable(buyer):
             buyer.next_action_at = now
         added += 1
 
@@ -97,7 +111,7 @@ def start(session: Session, campaign: Campaign, *, now: datetime | None = None) 
     ).scalars():
         if target.is_active:
             buyer = session.get(Buyer, target.buyer_id)
-            if buyer is not None and buyer.next_action_at is None:
+            if buyer is not None and _wakeable(buyer):
                 buyer.next_action_at = now
     session.flush()
     return campaign
@@ -140,12 +154,28 @@ def progress(session: Session, campaign: Campaign) -> dict:
         select(func.count()).select_from(Call).where(Call.campaign_id == campaign.id)
     ).scalar_one()
 
-    reason_rows = session.execute(
-        select(Call.block_reason, func.count())
-        .where(Call.campaign_id == campaign.id, Call.status == CallStatus.BLOCKED)
-        .group_by(Call.block_reason)
-    ).all()
-    block_reasons = {reason or "UNSPECIFIED": int(n) for reason, n in reason_rows}
+    # Messages as well as calls: a refusal is filed against the channel it
+    # refused, and a messaging campaign whose blocks were counted from `calls`
+    # alone reports "blocked: 0" while nothing at all is going out.
+    reason_rows = (
+        session.execute(
+            select(Call.block_reason, func.count())
+            .where(Call.campaign_id == campaign.id, Call.status == CallStatus.BLOCKED)
+            .group_by(Call.block_reason)
+        ).all()
+        + session.execute(
+            select(Message.block_reason, func.count())
+            .where(
+                Message.campaign_id == campaign.id,
+                Message.status == MessageStatus.BLOCKED,
+            )
+            .group_by(Message.block_reason)
+        ).all()
+    )
+    block_reasons: dict[str, int] = {}
+    for reason, n in reason_rows:
+        key = reason or "UNSPECIFIED"
+        block_reasons[key] = block_reasons.get(key, 0) + int(n)
 
     return {
         "targets": len(targets),

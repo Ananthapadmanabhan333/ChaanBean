@@ -20,6 +20,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.identity import audit
 from app.ingestion.normalise import (
     NormalisationError,
     normalise_amount,
@@ -286,6 +287,57 @@ def preview(session: Session, batch: ImportBatch, *, sample_size: int = 5) -> Pr
     )
 
 
+def overwrite_contact(
+    session: Session,
+    buyer: Buyer,
+    *,
+    name: str,
+    email: str | None,
+    company_id: UUID,
+    actor_id: UUID | None,
+    actor_label: str,
+) -> None:
+    """Overwrite a buyer's name and address from a source file, leaving evidence.
+
+    `PATCH /trade/buyers/{id}` is not the only writer of these two fields, and
+    this is the other one. A data principal who told us their name was recorded
+    wrongly has it corrected there, with a before-and-after row; re-importing
+    the same file reverts it here. The revert may well be the right answer —
+    the ERP is usually the system of record — but it cannot be the silent one,
+    because `name` is what a legal notice is addressed to and "who was it
+    addressed to before, and who changed it" has to survive.
+
+    The aggregate counts the import route audits cannot answer that: they say
+    twelve buyers were updated, not which twelve or from what.
+    """
+    before: dict[str, str | None] = {}
+    after: dict[str, str | None] = {}
+
+    if buyer.name != name:
+        before["name"], after["name"] = buyer.name, name
+        buyer.name = name
+    # A source with no address does not clear one we hold; only a person does,
+    # through the correction route.
+    if email and buyer.email != email:
+        before["email"], after["email"] = buyer.email, email
+        buyer.email = email
+
+    if not after:
+        return
+    audit.record(
+        session,
+        action="buyer.corrected",
+        company_id=company_id,
+        actor_id=actor_id,
+        actor_label=actor_label,
+        entity_type="buyer",
+        entity_id=buyer.id,
+        before=before,
+        after=after,
+        detail="overwritten from an imported source row",
+    )
+
+
 def commit(session: Session, batch: ImportBatch, *, committed_by: UUID | None = None) -> dict:
     """Apply a previewed batch in one transaction."""
     if batch.status != "PREVIEWED":
@@ -317,9 +369,15 @@ def commit(session: Session, batch: ImportBatch, *, committed_by: UUID | None = 
             session.flush()
             applied["buyers_created"] += 1
         else:
-            buyer.name = parsed["name"]
-            if parsed.get("email"):
-                buyer.email = parsed["email"]
+            overwrite_contact(
+                session,
+                buyer,
+                name=parsed["name"],
+                email=parsed.get("email"),
+                company_id=batch.company_id,
+                actor_id=committed_by,
+                actor_label=f"csv import {batch.filename}",
+            )
             applied["buyers_updated"] += 1
 
         existing = {p.e164 for p in buyer.phones}

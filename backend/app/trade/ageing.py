@@ -15,7 +15,8 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import AgeingBucket, Invoice, InvoiceStatus
+from app.models import AgeingBucket, Invoice
+from app.trade import UNCOLLECTABLE_STATUSES
 
 
 def days_past_due(due_date: date, as_of: date) -> int:
@@ -94,7 +95,7 @@ def buyer_position(session: Session, buyer_id: UUID, as_of: date) -> BuyerPositi
         session.execute(
             select(Invoice).where(
                 Invoice.buyer_id == buyer_id,
-                Invoice.status.notin_([InvoiceStatus.CANCELLED, InvoiceStatus.WRITTEN_OFF]),
+                Invoice.status.notin_(UNCOLLECTABLE_STATUSES),
             )
         ).scalars()
     )

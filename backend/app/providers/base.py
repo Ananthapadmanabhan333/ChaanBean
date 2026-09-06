@@ -13,10 +13,11 @@ four copies of a safety check is three chances to forget one.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Protocol, runtime_checkable
 
 from app.config import settings
+from app.models import DndStatus
 
 
 class ContactBlocked(RuntimeError):
@@ -129,6 +130,56 @@ class TelephonyBackend(Protocol):
     ) -> OriginateResult: ...
 
     def hangup(self, channel_id: str) -> None: ...
+
+
+# ---------------------------------------------------- do-not-call registry
+
+
+class UnknownDndStatus(ValueError):
+    """A DND backend answered with something outside `DndStatus`."""
+
+
+@dataclass(frozen=True)
+class DndCheck:
+    """What a registry says about one number, and when it said it.
+
+    `checked_at` is the backend's timestamp, not the caller's. A scrubbing vendor
+    answering from a nightly bulk file is reporting last night's position, and
+    the policy engine's staleness gate only means something if it measures the
+    age of the *answer* rather than the age of our asking for one.
+    """
+
+    e164: str
+    status: DndStatus
+    checked_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, DndStatus):
+            raise UnknownDndStatus(
+                f"DndCheck.status must be a DndStatus; got {self.status!r}. "
+                f"A registry answer nobody can interpret is not an answer, and it "
+                f"must not reach a column the calling decision reads."
+            )
+        if self.checked_at.tzinfo is None:
+            raise ValueError(
+                f"DndCheck.checked_at must be timezone-aware; got {self.checked_at!r}. "
+                f"The policy engine subtracts this from an aware `now`, so a naive "
+                f"timestamp raises there — on the dispatch path, mid-campaign."
+            )
+
+
+@runtime_checkable
+class DndBackend(Protocol):
+    """Is this number on the do-not-call registry, and how old is that answer.
+
+    There is no "not found" return. A number absent from the registry is CLEAR,
+    which is an answer; a backend that could not reach the registry raises,
+    because "we could not ask" must never be recorded as "we were told".
+    """
+
+    name: str
+
+    def check(self, e164: str) -> DndCheck: ...
 
 
 # ----------------------------------------------------- company registries
