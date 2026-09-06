@@ -72,12 +72,18 @@ Sign in as `owner@acme.test` / `acme-demo-pass`. The `legal@acme.test` account
 holds `legal_approver` and nothing else — approving legal content is not an
 administrative privilege, and that role separation is real.
 
-**Docker is not required.** It only runs Postgres and Redis. WSL Ubuntu with
-`apt install postgresql-16 redis-server` works identically. Avoid managed cloud
-Postgres for *development*: `crp_worker` needs `BYPASSRLS`, which requires
-superuser, and Supabase/Neon do not grant it — you would lose the ability to run
-the tests that prove tenant isolation. It is fine for *hosting*, where the app
-connects as the unprivileged `crp_app`.
+**Docker is not required**, and there is a scripted alternative. It only ever
+runs Postgres and Redis, so `scripts/wsl-devdb.sh` provisions the same thing
+inside WSL — including the three roles, which is the part that matters:
+
+```bash
+wsl -d Ubuntu -u root -- bash /mnt/c/<path>/scripts/wsl-devdb.sh
+```
+
+Avoid managed cloud Postgres for *development*: `crp_worker` needs `BYPASSRLS`,
+which requires superuser, and Supabase/Neon do not grant it — you would lose the
+ability to run the tests that prove tenant isolation. It is fine for *hosting*,
+where the app connects as the unprivileged `crp_app`.
 
 ### What the demo shows
 
@@ -383,7 +389,7 @@ dialling is the one that gets its trunk suspended.
 cd backend && pytest -q && lint-imports
 ```
 
-**354 tests, 3 import-linter contracts.** The ones that matter most, each
+**377 tests, 3 import-linter contracts.** The ones that matter most, each
 watched to fail with its guard removed:
 
 - every `BlockReason` has a case, and the suite fails when a new one is added
@@ -462,9 +468,10 @@ sources drop in behind them.
 
 ## This branch
 
-`security-hardening` carries work that is **written and compiling but not yet
-executed against a database**, because the local Postgres was down when it was
-produced. Read this section before merging.
+`security-hardening` fixes four defects found in shipped code. **All of it has
+now been executed against a real database**: 377 tests pass, 3 import-linter
+contracts hold, and the RLS retrofit applies cleanly to an empty database
+through all five migrations.
 
 **1. RLS retrofit — the significant one.** An audit found that of 57 tenant
 tables, only `credit_assessments` carried an RLS policy created by its own
@@ -489,16 +496,30 @@ company-scoped email lookups, and API-key scope validation.
 had never executed anywhere but one laptop. The new pipeline runs Postgres and
 Redis as services and fails — rather than skips — when the database is missing.
 
-### Before merging
+**5. A clean install was broken**, and this is the one that would have bitten a
+deployment rather than a developer. `fastapi` was pinned but `starlette` and
+`anyio` were not, so a fresh `pip install -r requirements.txt` resolved
+`anyio 4.15.1` — which deprecates `anyio.abc.BlockingPortal`, an alias the
+pinned starlette reaches during its *own* import. Because `pytest.ini`
+escalates `DeprecationWarning` to an error, three modules failed to **collect**.
+It stayed invisible because this machine had drifted to a different fastapi
+than the file declares, so the developer environment and a fresh deploy were
+installing different software. Both transitives are now pinned.
 
-```bash
-cd backend
-alembic upgrade head        # the RLS retrofit must apply cleanly
-pytest -q                   # all 354 must pass, not skip
-lint-imports
+### Verifying it yourself
+
+`scripts/verify_rls.py` is a standing audit, not a one-off — it asks whether
+every tenant table is actually isolated, rather than whether the DDL executed:
+
+```
+tenant tables expected : 57
+EVERY tenant table: RLS enabled, FORCE set, exactly one policy.
+audit_log grants: crp_app -> SELECT, INSERT only
+audit_log triggers: ['audit_log_append_only']
+  crp_app cannot UPDATE or DELETE the audit trail.
 ```
 
-One builder made a judgement call worth reviewing: `crp_worker` keeps `DELETE`
-on `audit_log`, because it traced that the test-suite teardown connects as that
-role and a revoke would fail teardown at the ACL check before any trigger fired.
-The trigger exempts roles carrying `rolsuper` or `rolbypassrls`.
+One judgement call worth reviewing: `crp_worker` keeps `DELETE` on `audit_log`,
+because the test-suite teardown connects as that role and a revoke would fail at
+the ACL check before any trigger fired. The trigger exempts roles carrying
+`rolsuper` or `rolbypassrls`.
