@@ -19,3 +19,5 @@ asterisk/conf/*.local.conf
 .DS_Store
 .idea/
 .vscode/
+
+.vercel

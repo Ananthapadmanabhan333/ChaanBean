@@ -29,6 +29,34 @@ _BACKEND = Path(__file__).resolve().parent.parent / "backend"
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from app.main import app  # noqa: E402  (path must be set first)
+from app.main import app as _app  # noqa: E402  (path must be set first)
+
+_PREFIX = "/api/index"
+
+
+async def app(scope, receive, send):
+    """Restore the original request path before handing off to FastAPI.
+
+    `vercel.json` rewrites every route to `/api/index` so that one function
+    serves the whole surface. The rewrite is what the function actually
+    receives, so FastAPI sees `/api/index` rather than `/health` or
+    `/api/portal/state` and 404s on everything — the app boots perfectly and
+    answers nothing, which is a confusing way to fail.
+
+    Stripping the prefix here keeps the routing fix at the edge instead of
+    reshaping every route to suit one host. It is a no-op on any platform that
+    already passes the original path through, so nothing breaks locally.
+    """
+    if scope["type"] in ("http", "websocket"):
+        path = scope.get("path", "")
+        # Loop rather than strip once: a rewrite that matches its own output
+        # would nest the prefix, and one leftover `/api/index` is the
+        # difference between the portal and a 404.
+        while path == _PREFIX or path.startswith(_PREFIX + "/"):
+            path = path[len(_PREFIX):] or "/"
+        if path != scope.get("path", ""):
+            scope = dict(scope, path=path, raw_path=path.encode("utf-8"))
+    await _app(scope, receive, send)
+
 
 __all__ = ["app"]
