@@ -94,7 +94,14 @@ def permissions_for(roles) -> frozenset[Permission]:
         try:
             role = Role(name)
         except ValueError:
-            continue  # an unrecognised role grants nothing, it does not error open
+            # An API-key scope may name one permission directly ("buyer:read");
+            # it grants exactly that permission and nothing wider. Any other
+            # unrecognised string grants nothing — it does not error open.
+            try:
+                granted.add(Permission(name))
+            except ValueError:
+                pass
+            continue
         granted |= ROLE_PERMISSIONS.get(role, frozenset())
     return frozenset(granted)
 

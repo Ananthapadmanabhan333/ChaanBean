@@ -192,23 +192,25 @@ def test_an_unknown_supabase_user_gets_403_not_a_tenant(supabase_mode, tenants):
     assert "not a member of any company" in exc.value.detail
 
 
-def test_first_login_links_an_invited_user_by_email(tenants, supabase_mode):
-    """An admin invites by email; the stable subject binds on first sight."""
+def test_an_email_match_alone_grants_nothing(tenants, supabase_mode):
+    """Deliberate change: the email-fallback link is gone.
+
+    Binding a subject to whichever row carried a matching email meant whoever
+    wrote an address into a tenant first captured the account that later signed
+    in with it — invitation squatting. Membership now arrives only through
+    registration or a signed invite token; a matching email by itself is 403,
+    and the row stays unlinked.
+    """
     subject = str(uuid.uuid4())
     with admin_session() as s:
         email = s.get(User, tenants.b.user_id).email
 
-    principal = supabase.principal_from_supabase_token(
-        make_token(sub=subject, email=email)
-    )
-    assert principal.company_id == tenants.b.company_id
+    with pytest.raises(HTTPException) as exc:
+        supabase.principal_from_supabase_token(make_token(sub=subject, email=email))
+    assert exc.value.status_code == 403
 
     with admin_session() as s:
-        user = s.execute(
-            select(User).where(User.external_auth_id == subject)
-        ).scalar_one()
-        assert user.email == email
-        user.external_auth_id = None
+        assert s.get(User, tenants.b.user_id).external_auth_id is None
 
 
 def test_an_inactive_user_is_refused(linked_user):
@@ -393,28 +395,35 @@ def test_signup_is_idempotent_for_an_already_linked_user(api_client, linked_user
     assert body["company_id"] == str(linked_user["company_id"])
 
 
-def test_an_invited_email_joins_that_company_instead_of_making_a_new_one(
-    api_client, tenants
-):
-    """The only path that joins an existing tenant — and only because an admin
-    there put this email in first."""
-    with admin_session() as s:
-        invited_email = s.get(User, tenants.b.user_id).email
-        s.get(User, tenants.b.user_id).external_auth_id = None
+def test_a_matching_email_no_longer_joins_an_existing_company(api_client, tenants):
+    """Deliberate change: registration ignores email matches entirely.
 
-    subject = str(uuid.uuid4())
+    Joining a tenant by registering with an email someone there had written
+    down was the same squatting hole as the login-time fallback. Joining now
+    happens only through `/api/auth/accept-invite` with a signed invite token;
+    a stranger whose email happens to match an existing user gets a fresh,
+    empty company like anyone else — and the existing user stays untouched.
+    """
+    marker = uuid.uuid4().hex[:8]
+    with admin_session() as s:
+        existing_email = s.get(User, tenants.b.user_id).email
+
     res = api_client.post(
         "/api/auth/register",
-        json={"company_name": "Attempted New Co"},
-        headers={"Authorization": f"Bearer {make_token(sub=subject, email=invited_email)}"},
+        json={"company_name": f"Not Tenant B {marker}"},
+        headers={
+            "Authorization": f"Bearer {make_token(sub=str(uuid.uuid4()), email=existing_email)}"
+        },
     )
-    assert res.status_code == 201
-    body = res.json()
-    assert body["status"] == "joined_by_invitation"
-    assert body["company_id"] == str(tenants.b.company_id)
-
-    with admin_session() as s:
-        s.get(User, tenants.b.user_id).external_auth_id = None
+    try:
+        assert res.status_code == 201
+        body = res.json()
+        assert body["status"] == "company_created"
+        assert body["company_id"] != str(tenants.b.company_id)
+        with admin_session() as s:
+            assert s.get(User, tenants.b.user_id).external_auth_id is None
+    finally:
+        _cleanup_company(marker)
 
 
 def test_registration_requires_a_verified_token(api_client):

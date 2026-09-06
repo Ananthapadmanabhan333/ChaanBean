@@ -15,14 +15,14 @@ from datetime import timedelta
 import pytest
 import redis as redis_lib
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text, update
+from sqlalchemy.exc import DBAPIError
 
 from app.config import settings
 from app.db import (
     TENANT_SETTING,
     admin_session,
     engine,
-    rls_report,
     tenant_session,
     tenant_tables,
 )
@@ -131,12 +131,25 @@ def test_every_tenant_table_has_rls():
 
     Eight later phases add tables. A human will forget one, and this is what
     catches it before the forgotten table leaks a debtor list.
+
+    Exactly one policy, and by name. Policies on a table are OR-ed together,
+    so a stray second policy is a quiet widening, not defence in depth.
     """
     with engine.connect() as conn:
-        report = {
-            name: (enabled, forced, policies)
-            for name, enabled, forced, policies in rls_report(conn)
-        }
+        rows = conn.execute(
+            text(
+                "SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity, "
+                "  array_remove(array_agg(p.polname), NULL) "
+                "FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "LEFT JOIN pg_policy p ON p.polrelid = c.oid "
+                "WHERE n.nspname = 'public' AND c.relkind = 'r' "
+                "AND c.relname = ANY(:names) "
+                "GROUP BY c.relname, c.relrowsecurity, c.relforcerowsecurity"
+            ),
+            {"names": tenant_tables()},
+        ).all()
+    report = {name: (enabled, forced, policies) for name, enabled, forced, policies in rows}
 
     missing = [t for t in tenant_tables() if t not in report]
     assert not missing, f"tables absent from the database: {missing}"
@@ -144,9 +157,9 @@ def test_every_tenant_table_has_rls():
     unprotected = [
         name
         for name, (enabled, forced, policies) in report.items()
-        if not (enabled and forced and policies)
+        if not (enabled and forced and policies == ["tenant_isolation"])
     ]
-    assert not unprotected, f"tables without enforced RLS: {unprotected}"
+    assert not unprotected, f"tables without exactly tenant_isolation enforced: {unprotected}"
 
 
 def test_companies_table_is_itself_isolated(tenants):
@@ -390,3 +403,57 @@ def test_audit_rows_are_written_and_tenant_scoped(tenants):
 
     with tenant_session(tenants.b.company_id) as s:
         assert s.execute(select(AuditLog)).scalars().all() == []
+
+
+def test_audit_log_is_append_only_for_the_application_role(tenants):
+    """The audit trail is the defence in a DPDP or defamation complaint; a
+    trail the application role can rewrite proves nothing. Refusal comes from
+    the database — a revoked grant or the audit_log_append_only trigger — not
+    from code discipline."""
+    with tenant_session(tenants.a.company_id) as s:
+        audit.record(
+            s,
+            action=audit.Action.LOGIN,
+            company_id=tenants.a.company_id,
+            actor_id=tenants.a.user_id,
+        )
+
+    with pytest.raises(DBAPIError, match="permission denied|audit_log_append_only"):
+        with tenant_session(tenants.a.company_id) as s:
+            s.execute(update(AuditLog).values(detail="rewritten"))
+
+    with pytest.raises(DBAPIError, match="permission denied|audit_log_append_only"):
+        with tenant_session(tenants.a.company_id) as s:
+            s.execute(delete(AuditLog))
+
+    # The row survived both attempts — a refusal, not a silent no-op.
+    with tenant_session(tenants.a.company_id) as s:
+        assert s.execute(select(AuditLog)).scalars().all()
+
+
+def test_audit_rows_stay_deletable_through_the_admin_path(tenants):
+    """conftest teardown removes its audit rows via `admin_session`, which runs
+    on the BYPASSRLS worker role — the one mutation path append-only leaves
+    open, and only for DELETE. UPDATE is refused even there: nothing may ever
+    rewrite a row."""
+    with tenant_session(tenants.a.company_id) as s:
+        audit.record(
+            s,
+            action=audit.Action.LOGIN,
+            company_id=tenants.a.company_id,
+            actor_id=tenants.a.user_id,
+        )
+
+    with pytest.raises(DBAPIError, match="permission denied|audit_log_append_only"):
+        with admin_session() as s:
+            s.execute(
+                update(AuditLog)
+                .where(AuditLog.company_id == tenants.a.company_id)
+                .values(detail="rewritten")
+            )
+
+    with admin_session() as s:
+        deleted = s.execute(
+            delete(AuditLog).where(AuditLog.company_id == tenants.a.company_id)
+        ).rowcount
+    assert deleted >= 1, "the admin path must still delete, or teardown breaks"

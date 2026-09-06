@@ -77,6 +77,9 @@ class User(Base, TimestampMixin):
     phone_e164: Mapped[str | None] = mapped_column(String(20))  # OTP login
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Tokens minted before this instant are refused — set on password change or
+    # forced logout. NULL means nothing has ever been revoked.
+    tokens_valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # `foreign_keys` is required: RoleGrant points at users twice, once for the
     # holder and once for whoever granted it.

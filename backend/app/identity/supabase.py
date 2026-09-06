@@ -189,15 +189,12 @@ def principal_from_supabase_token(token: str):
             select(User).where(User.external_auth_id == identity.subject)
         ).scalar_one_or_none()
 
-        # Fall back to email only when the account has not been linked yet, and
-        # bind it on first sight so later logins match on the stable id.
-        if user is None and identity.email:
-            user = session.execute(
-                select(User).where(User.email == identity.email)
-            ).scalar_one_or_none()
-            if user is not None:
-                user.external_auth_id = identity.subject
-                log.info("linked Supabase subject to existing user %s", user.email)
+        # There is deliberately no fallback to email here. An email in a token
+        # proves control of a mailbox, not membership of a tenant — and linking
+        # on first sight meant whoever wrote an address into a tenant first
+        # captured the account that later signed in with it. Rows are bound to
+        # a verified subject at exactly two audited moments instead:
+        # registration, and invite acceptance.
 
         if user is None:
             # Authenticated by Supabase, but unknown here. That is not an

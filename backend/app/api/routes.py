@@ -49,9 +49,11 @@ from app.identity import audit
 from app.identity.auth import (
     Principal,
     create_access_token,
+    create_invite_token,
     create_refresh_token,
     current_principal,
     require,
+    revoke_sessions,
     tenant_db,
     verify_password,
 )
@@ -100,14 +102,24 @@ auth_router = APIRouter(prefix="/auth", tags=["auth"])
 @auth_router.post("/login", response_model=TokenResponse)
 def login(body: LoginRequest, session: Session = Depends(lambda: None)):
     # Login cannot use `tenant_db`: there is no tenant until the user is known.
-    # It reads one row through the cross-tenant path and binds nothing.
+    # It reads through the cross-tenant path and binds nothing.
     from app.db import admin_session
 
     with admin_session() as s:
-        user = s.execute(select(User).where(User.email == body.email)).scalar_one_or_none()
-        if user is None or not user.is_active or not verify_password(
-            body.password, user.password_hash
-        ):
+        # Emails are unique per (company_id, email), so one address may exist
+        # in several tenants and this cross-tenant lookup may return several
+        # rows. The password is what picks the account — never row order — and
+        # every candidate's hash is verified even after one matches, so the
+        # response time does not say how many tenants know this address.
+        candidates = list(
+            s.execute(select(User).where(User.email == body.email)).scalars()
+        )
+        user = None
+        for candidate in candidates:
+            ok = verify_password(body.password, candidate.password_hash)
+            if ok and candidate.is_active and user is None:
+                user = candidate
+        if user is None:
             # Deliberately identical for "no such user" and "wrong password".
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
 
@@ -158,12 +170,14 @@ def register(body: dict, request: Request):
     exists would hand them that company's debtor list, which is the single worst
     thing this system could do. So:
 
-    * already linked        -> return their existing account, unchanged
-    * invited (email known) -> join that company with the roles the admin set
-    * nobody knows them     -> create a fresh, empty company and make them owner
+    * already linked -> return their existing account, unchanged
+    * anyone else    -> create a fresh, empty company and make them owner
 
-    Only the middle case joins an existing tenant, and it only happens because
-    an admin there put their email in first.
+    Joining an existing tenant happens only through `/api/auth/accept-invite`,
+    against a signed invite token. A matching email deliberately counts for
+    nothing here: an email is a claim, not a credential, and honouring it let
+    whoever typed a stranger's address into a tenant first capture the account
+    that later signed in with it.
     """
     from app.db import admin_session
     from app.identity.supabase import verify
@@ -190,23 +204,6 @@ def register(body: dict, request: Request):
                 "status": "already_registered",
                 "company_id": str(existing.company_id),
                 "roles": sorted(existing.roles),
-            }
-
-        invited = s.execute(
-            select(User).where(func.lower(User.email) == identity.email.lower())
-        ).scalar_one_or_none()
-        if invited is not None:
-            invited.external_auth_id = identity.subject
-            s.flush()
-            audit.record(
-                s, action=audit.Action.LOGIN, company_id=invited.company_id,
-                actor_id=invited.id, actor_label=identity.email,
-                detail="accepted invitation",
-            )
-            return {
-                "status": "joined_by_invitation",
-                "company_id": str(invited.company_id),
-                "roles": sorted(invited.roles),
             }
 
         if not company_name:
@@ -249,11 +246,13 @@ def invite_user(
     session: Session = Depends(tenant_db),
     principal: Principal = Depends(require(Permission.USER_MANAGE)),
 ):
-    """Add a colleague to *your* company.
+    """Invite a colleague into *your* company: a signed grant, not a row.
 
-    Creates the row with no credential. Whenever they first sign in — by
-    password, Google, or anything else Supabase supports — their identity binds
-    to this row and they land in this company with exactly the roles set here.
+    Nothing is written to `users` here. The earlier design pre-created the row
+    and let the first sign-in with a matching email claim it — so an admin
+    could type anyone's address and capture the account behind it. The token
+    that replaces the row is signed, names email + company + roles, and dies in
+    seven days; the row is created at acceptance, bound to a real credential.
     """
     email = (body or {}).get("email", "").strip().lower()
     roles = (body or {}).get("roles") or ["viewer"]
@@ -261,7 +260,6 @@ def invite_user(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "a valid email is required")
 
     from app.identity.rbac import Role
-    from app.models import RoleGrant
 
     valid = {r.value for r in Role}
     unknown = set(roles) - valid
@@ -270,27 +268,198 @@ def invite_user(
             status.HTTP_400_BAD_REQUEST, f"unknown role(s): {', '.join(sorted(unknown))}"
         )
 
+    # Scoped to this company. The same address may exist in other tenants, and
+    # whether it does is none of this tenant's business.
     if session.execute(
-        select(User).where(func.lower(User.email) == email)
-    ).scalar_one_or_none():
-        raise HTTPException(status.HTTP_409_CONFLICT, "that email already has an account")
-
-    user = User(company_id=principal.company_id, email=email, password_hash=None)
-    session.add(user)
-    session.flush()
-    for role in roles:
-        session.add(
-            RoleGrant(
-                company_id=principal.company_id, user_id=user.id, role=role,
-                granted_by=principal.user_id,
-            )
+        select(User).where(
+            User.company_id == principal.company_id, func.lower(User.email) == email
         )
+    ).scalars().first() is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "that email already has an account in this company"
+        )
+
+    invite_token, expires_at = create_invite_token(
+        email=email, company_id=principal.company_id, roles=list(roles)
+    )
     audit.record_for(
-        principal=principal, session=session, action=audit.Action.USER_CREATED,
-        entity_type="user", entity_id=user.id, after={"email": email, "roles": roles},
+        principal=principal, session=session, action=audit.Action.USER_INVITED,
+        entity_type="invite", after={"email": email, "roles": list(roles)},
     )
     session.commit()
-    return {"email": email, "roles": roles, "status": "invited"}
+    return {
+        "invite_token": invite_token,
+        "expires_at": expires_at.isoformat(),
+        "email": email,
+        "roles": list(roles),
+        "status": "invited",
+    }
+
+
+@auth_router.post("/accept-invite", status_code=201)
+def accept_invite(body: dict, request: Request):
+    """Join the company named in a signed invite token.
+
+    The token — not any pre-created row — is the grant. The credential that
+    must accompany it mirrors the auth backend:
+
+    * supabase — a verified Supabase bearer token whose email equals the
+      invite's. The row is created linked to that verified subject, with
+      company and roles taken from the **invite**; the bearer token contributes
+      identity and nothing else.
+    * local — a password, hashed into the new row.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from app.config import settings
+    from app.db import admin_session
+    from app.identity.auth import decode_token, hash_password
+    from app.models import RoleGrant
+
+    invite_token = str((body or {}).get("invite_token") or "")
+    if not invite_token:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invite_token is required")
+
+    claims = decode_token(invite_token, expected_type="invite")
+    invite_email = (claims.get("email") or "").lower()
+    raw_company = claims.get("company_id")
+    roles = claims.get("roles") or []
+    if not invite_email or not raw_company:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "malformed invite token")
+    try:
+        company_id = UUID(str(raw_company))
+    except ValueError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "malformed invite token")
+
+    external_auth_id = None
+    password_hash = None
+    if settings.auth_backend == "supabase":
+        from app.identity.supabase import verify
+
+        auth = request.headers.get("authorization", "")
+        if not auth.lower().startswith("bearer "):
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "sign in first, then accept the invite"
+            )
+        identity = verify(auth.split(" ", 1)[1])
+        # The invite grants membership to one mailbox. A verified token for any
+        # other mailbox is someone else, however they came by the invite link.
+        if not identity.email or identity.email.lower() != invite_email:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "this invite was issued to a different email address",
+            )
+        external_auth_id = identity.subject
+    else:
+        password = (body or {}).get("password") or ""
+        if not password:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "a password is required to accept an invite"
+            )
+        try:
+            password_hash = hash_password(password)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+
+    with admin_session() as s:
+        company = s.get(Company, company_id)
+        if company is None or not company.is_active:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "the inviting company no longer exists"
+            )
+        if external_auth_id is not None and s.execute(
+            select(User).where(User.external_auth_id == external_auth_id)
+        ).scalars().first() is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "this identity is already linked to an account"
+            )
+        if s.execute(
+            select(User).where(
+                User.company_id == company_id, func.lower(User.email) == invite_email
+            )
+        ).scalars().first() is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "that email already has an account in this company",
+            )
+        user = User(
+            company_id=company_id,
+            email=invite_email,
+            external_auth_id=external_auth_id,
+            password_hash=password_hash,
+        )
+        s.add(user)
+        try:
+            s.flush()
+        except IntegrityError:
+            # A concurrent acceptance of the same invite. The unique
+            # constraints are the arbiter, and second place is a conflict.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "that email already has an account in this company",
+            )
+        for role in roles:
+            s.add(RoleGrant(company_id=company_id, user_id=user.id, role=role))
+        audit.record(
+            s, action=audit.Action.USER_CREATED, company_id=company_id,
+            actor_id=user.id, actor_label=invite_email, detail="accepted invitation",
+        )
+        user_id = user.id
+
+    return {
+        "status": "joined",
+        "user_id": str(user_id),
+        "company_id": str(company_id),
+        "email": invite_email,
+        "roles": sorted(roles),
+    }
+
+
+@auth_router.post("/revoke-sessions")
+def revoke_user_sessions(
+    body: dict | None = None,
+    session: Session = Depends(tenant_db),
+    principal: Principal = Depends(current_principal),
+):
+    """Invalidate every token issued to a user before this moment.
+
+    Self-service by design — walking away from a compromised session must not
+    need an admin — and USER_MANAGE for anyone else in the company. Another
+    tenant's user id is indistinguishable from a nonexistent one: RLS makes
+    both a 404.
+    """
+    raw = (body or {}).get("user_id")
+    target_id = None
+    if raw is not None:
+        try:
+            target_id = UUID(str(raw))
+        except ValueError:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, "user_id must be a UUID"
+            )
+
+    if target_id is None or target_id == principal.user_id:
+        if principal.user_id is None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "an API key holds no user sessions to revoke"
+            )
+        target_id = principal.user_id
+    elif not principal.can(Permission.USER_MANAGE):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"missing permission {Permission.USER_MANAGE.value}",
+        )
+
+    user = session.get(User, target_id)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user in this company")
+    revoke_sessions(user)
+    audit.record_for(
+        principal=principal, session=session, action=audit.Action.SESSIONS_REVOKED,
+        entity_type="user", entity_id=user.id,
+    )
+    session.commit()
+    return {"status": "sessions revoked", "user_id": str(user.id)}
 
 
 @auth_router.get("/me")

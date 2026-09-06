@@ -20,6 +20,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 
 from app.db import admin_session
+from app.identity.rbac import Permission, Role
 from app.models import ApiKey
 
 PREFIX_BYTES = 6
@@ -37,9 +38,24 @@ def generate_key() -> tuple[str, str, str]:
     return f"crp_{prefix}_{secret}", prefix, _hash_secret(secret)
 
 
+def _validate_scopes(scopes: list[str]) -> None:
+    """A scope matching nothing grants nothing — silently. Refusing at creation
+    turns that silently-dead key into a sentence while whoever typed it can
+    still fix the typo. Valid scopes are role names or single permission values
+    (see `rbac.permissions_for` for how each is read)."""
+    valid = {p.value for p in Permission} | {r.value for r in Role}
+    unknown = [s for s in scopes if s not in valid]
+    if unknown:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"unknown scope(s): {', '.join(sorted(set(unknown)))}",
+        )
+
+
 def create_api_key(
     session, *, company_id: UUID, name: str, scopes: list[str], created_by: UUID | None
 ) -> tuple[ApiKey, str]:
+    _validate_scopes(scopes)
     full_key, prefix, key_hash = generate_key()
     key = ApiKey(
         company_id=company_id,

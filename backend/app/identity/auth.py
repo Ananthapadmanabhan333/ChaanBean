@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db import get_session, set_tenant
+from app.db import admin_session, get_session, set_tenant
 from app.identity.rbac import Permission, has_permission
 from app.models import User
 
@@ -93,6 +93,35 @@ def create_refresh_token(*, user_id: UUID, company_id: UUID) -> str:
         "exp": int((_now() + timedelta(days=settings.refresh_ttl_days)).timestamp()),
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM)
+
+
+INVITE_TTL_DAYS = 7
+
+
+def create_invite_token(
+    *, email: str, company_id: UUID, roles, ttl_days: int | None = None
+) -> tuple[str, datetime]:
+    """A signed, expiring invitation. **No user row exists until acceptance.**
+
+    The row-first design keyed the join on an email string, and an email string
+    is a claim anyone can type: an admin of one tenant could enter a stranger's
+    address and capture that person's account on first sign-in. This token binds
+    email, tenant and roles under our signature instead, so membership is
+    granted only to whoever presents this exact grant — and only until it
+    expires. Returns `(token, expires_at)`.
+    """
+    ttl = ttl_days if ttl_days is not None else INVITE_TTL_DAYS
+    expires = _now() + timedelta(days=ttl)
+    payload = {
+        "jti": secrets.token_hex(16),  # two invites to one address stay distinct
+        "email": email,
+        "company_id": str(company_id),
+        "roles": sorted(roles),
+        "type": "invite",
+        "iat": int(_now().timestamp()),
+        "exp": int(expires.timestamp()),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM), expires
 
 
 def decode_token(token: str, *, expected_type: str = "access") -> dict:
@@ -168,10 +197,45 @@ class Principal:
         return has_permission(self.roles, permission)
 
 
+def revoke_sessions(user: User) -> None:
+    """Every token minted for `user` before this instant stops working.
+
+    Call this at the moments a 12-hour token outliving the decision would make
+    the decision a lie: explicit revocation, deactivation, a role change.
+    """
+    user.tokens_valid_from = _now()
+
+
+def _refuse_revoked(user_id: UUID, iat) -> None:
+    """The one database read local tokens pay so that revocation is real.
+
+    A signed token proves what was true at issue time; deactivation and
+    revocation happen afterwards. The lookup runs before any tenant is bound,
+    so it goes through the cross-tenant path — same necessity as API-key and
+    Supabase resolution.
+    """
+    with admin_session() as session:
+        user = session.get(User, user_id)
+        if user is None or not user.is_active:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found or inactive")
+        cutoff = user.tokens_valid_from
+    if cutoff is None:
+        return
+    # `iat` carries whole seconds, so the cutoff is truncated to match: a token
+    # minted in the very second the revocation landed survives, one minted any
+    # earlier second does not. A token without `iat` is a refusal, not a pass.
+    if iat is None or int(iat) < int(cutoff.timestamp()):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "token issued before last revocation"
+        )
+
+
 def principal_from_token(token: str) -> Principal:
     claims = decode_token(token)
+    user_id = UUID(claims["sub"])
+    _refuse_revoked(user_id, claims.get("iat"))
     return Principal(
-        user_id=UUID(claims["sub"]),
+        user_id=user_id,
         company_id=UUID(claims["company_id"]),
         roles=frozenset(claims.get("roles", [])),
     )

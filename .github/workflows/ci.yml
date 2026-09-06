@@ -1,0 +1,100 @@
+# The RLS suite is the proof that tenant isolation holds; until this file it had
+# only ever run on one laptop. Everything below is exactly what a fresh clone
+# needs — the same throwaway credentials docker-compose.yml uses, no secrets.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: crp
+          POSTGRES_PASSWORD: crp
+          POSTGRES_DB: crp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crp -d crp"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    # Three database roles, deliberately — see app/config.py. POSTGRES_USER
+    # creates `crp` as the container superuser; `python -m app.db rls` below
+    # provisions crp_app and crp_worker from it.
+    env:
+      DATABASE_URL: postgresql+psycopg://crp_app:crp_app@localhost:5432/crp
+      DATABASE_URL_WORKER: postgresql+psycopg://crp_worker:crp_worker@localhost:5432/crp
+      DATABASE_URL_ADMIN: postgresql+psycopg://crp:crp@localhost:5432/crp
+      REDIS_URL: redis://localhost:6379/0
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Migrate schema
+        run: python -m alembic upgrade head
+
+      # Roles and policies come from the application, not from migrations. This
+      # step doubles as the drift alarm: apply_rls walks the tables the models
+      # declare, so a model table the migrations forgot fails here with
+      # "relation does not exist" instead of being papered over by create_all.
+      - name: Apply RLS and provision roles
+        run: python -m app.db rls
+
+      - name: Run tests
+        run: python -m pytest --junitxml=pytest-report.xml
+
+      # conftest skips the whole suite when the database is unreachable — right
+      # on a laptop, wrong here, where an all-skip run would go green having
+      # proved nothing. Refuse it.
+      - name: Fail if the suite skipped instead of running
+        run: |
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          totals = {"tests": 0, "skipped": 0, "failures": 0, "errors": 0}
+          for suite in ET.parse("pytest-report.xml").getroot().iter("testsuite"):
+              for key in totals:
+                  totals[key] += int(suite.get(key, 0))
+          passed = totals["tests"] - totals["skipped"] - totals["failures"] - totals["errors"]
+          print(f"passed={passed} " + " ".join(f"{k}={v}" for k, v in totals.items()))
+          if totals["tests"] == 0:
+              sys.exit("refusing to pass: pytest collected no tests")
+          if passed == 0:
+              sys.exit("refusing to pass: every test skipped — the database bootstrap is broken")
+          PY
+
+      - name: Enforce module boundaries
+        run: lint-imports

@@ -225,6 +225,16 @@ def _ensure_role(conn: Connection, role: str, password: str, *, bypass_rls: bool
     conn.execute(
         text(f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role}")
     )
+    # The blanket grant above hands UPDATE and DELETE on audit_log straight
+    # back, silently undoing append-only every time this command re-runs. Take
+    # them back in the same breath. The BYPASSRLS role keeps DELETE:
+    # `admin_session` runs on it, and the test suite's teardown deletes its own
+    # audit rows through that path — the audit_log_append_only trigger exempts
+    # it for exactly that reason.
+    if bypass_rls:
+        conn.execute(text(f"REVOKE UPDATE ON audit_log FROM {role}"))
+    else:
+        conn.execute(text(f"REVOKE UPDATE, DELETE ON audit_log FROM {role}"))
     conn.execute(text(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role}"))
 
 

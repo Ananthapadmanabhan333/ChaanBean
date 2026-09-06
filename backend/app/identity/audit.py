@@ -26,8 +26,10 @@ class Action:
     LOGIN_FAILED = "auth.login_failed"
     OTP_REQUESTED = "auth.otp_requested"
     LOGOUT = "auth.logout"
+    SESSIONS_REVOKED = "auth.sessions_revoked"
 
     USER_CREATED = "user.created"
+    USER_INVITED = "user.invited"
     ROLE_GRANTED = "user.role_granted"
     ROLE_REVOKED = "user.role_revoked"
 
